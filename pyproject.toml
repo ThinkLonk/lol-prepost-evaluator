@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "artifacts", "data", "docs"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

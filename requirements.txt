@@ -1,0 +1,8 @@
+pandas
+scikit-learn
+streamlit
+joblib
+sqlalchemy
+psycopg
+alembic
+plotly

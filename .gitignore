@@ -1,0 +1,39 @@
+# Môi trường Python
+.venv/
+venv/
+env/
+
+# Biến môi trường và bí mật cục bộ
+.env
+.env.*
+!.env.example
+
+# Bí mật Streamlit
+.streamlit/secrets.toml
+
+# Bộ nhớ đệm và tệp sinh bởi công cụ
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Cấu hình trình soạn thảo và hệ điều hành
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Dữ liệu thô, báo cáo sinh tự động và model artifacts
+data/raw/*
+!data/raw/.gitkeep
+reports/data_quality/*
+!reports/data_quality/.gitkeep
+artifacts/models/*
+!artifacts/models/.gitkeep
+*.joblib
+*.pkl
+
+# Nhật ký chạy cục bộ
+*.log
