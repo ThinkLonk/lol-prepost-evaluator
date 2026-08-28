@@ -6,3 +6,4 @@ sqlalchemy
 psycopg
 alembic
 plotly
+mwrogue==0.1.5

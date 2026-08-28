@@ -37,3 +37,25 @@ artifacts/models/*
 
 # Nhật ký chạy cục bộ
 *.log
+
+# Công cụ AI/agent chỉ dùng local
+/AGENTS.md
+/.agents/
+/.codex/
+/.claude/
+/.cursor/
+/CLAUDE.md
+
+# Helper tạm được xuất từ sync_players
+/browser_exporter.js
+
+# Media tải từ nguồn ngoài
+# Champion assets nhỏ và bắt buộc nên vẫn được commit.
+/assets/teams/*
+!/assets/teams/.gitkeep
+/assets/players/*
+!/assets/players/.gitkeep
+
+# Manifest và file tải dở chỉ dùng local
+/assets/**/_sync_manifest.json
+/assets/**/*.part

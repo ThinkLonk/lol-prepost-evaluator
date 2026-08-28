@@ -104,3 +104,21 @@ def test_active_evaluation_partial_unique_index_exists() -> None:
 
     assert where_clause is not None
     assert "is_active is true" in str(where_clause).lower()
+
+    
+def test_reference_media_columns_exist() -> None:
+    inspector = inspect(engine)
+
+    team_columns = {
+        column["name"] for column in inspector.get_columns("team")
+    }
+    player_columns = {
+        column["name"] for column in inspector.get_columns("player")
+    }
+    champion_columns = {
+        column["name"] for column in inspector.get_columns("champion")
+    }
+
+    assert "logo_file" in team_columns
+    assert "photo_file" in player_columns
+    assert "image_file" in champion_columns

@@ -89,6 +89,7 @@ class Team(Base):
     team_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     canonical_name: Mapped[str] = mapped_column(String(150), nullable=False)
     display_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    logo_file: Mapped[str | None] = mapped_column(String(160),nullable=True,)
 
 
 class Player(Base):
@@ -99,6 +100,7 @@ class Player(Base):
     player_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     canonical_name: Mapped[str] = mapped_column(String(120), nullable=False)
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    photo_file: Mapped[str | None] = mapped_column(String(160),nullable=True,)
 
 
 class Champion(Base):
