@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Double,
     ForeignKey,
+    ForeignKeyConstraint,
     Identity,
     Index,
     SmallInteger,
@@ -34,7 +35,7 @@ class Tournament(Base):
 
     tournament_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
-    region: Mapped[str] = mapped_column(String(30), nullable=False)
+    region: Mapped[str | None] = mapped_column(String(30), nullable=True)
     season: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
 
@@ -85,8 +86,18 @@ class Team(Base):
     """Đội tuyển chuyên nghiệp."""
 
     __tablename__ = "team"
+    __table_args__ = (
+        UniqueConstraint(
+            "oracle_team_id",
+            name="uq_team_oracle_team_id",
+        ),
+    )
 
     team_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    oracle_team_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     canonical_name: Mapped[str] = mapped_column(String(150), nullable=False)
     display_name: Mapped[str] = mapped_column(String(150), nullable=False)
     logo_file: Mapped[str | None] = mapped_column(String(160),nullable=True,)
@@ -96,8 +107,18 @@ class Player(Base):
     """Tuyển thủ chuyên nghiệp."""
 
     __tablename__ = "player"
+    __table_args__ = (
+        UniqueConstraint(
+            "oracle_player_id",
+            name="uq_player_oracle_player_id",
+        ),
+    )
 
     player_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    oracle_player_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     canonical_name: Mapped[str] = mapped_column(String(120), nullable=False)
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
     photo_file: Mapped[str | None] = mapped_column(String(160),nullable=True,)
@@ -120,17 +141,37 @@ class Game(Base):
     __tablename__ = "game"
     __table_args__ = (
         CheckConstraint(
-            "winner_team_id IS NULL OR ended_at IS NOT NULL",
-            name="ck_game_winner_requires_end",
+            "("
+            "series_id IS NOT NULL AND stage_id IS NULL"
+            ") OR ("
+            "series_id IS NULL AND stage_id IS NOT NULL"
+            ")",
+            name="ck_game_exactly_one_parent",
+        ),
+        ForeignKeyConstraint(
+            ["game_id", "winner_team_id"],
+            ["game_team.game_id", "game_team.team_id"],
+            name="fk_game_winner_participant",
+            deferrable=True,
+            initially="DEFERRED",
+            use_alter=True,
         ),
         Index("ix_game_scheduled_at", "scheduled_at"),
     )
 
     game_id: Mapped[str] = mapped_column(String(100), primary_key=True)
-    series_id: Mapped[str] = mapped_column(
+    series_id: Mapped[str | None] = mapped_column(
         String(80),
         ForeignKey("series.series_id"),
-        nullable=False,
+        nullable=True,
+    )
+    stage_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey(
+            "tournament_stage.stage_id",
+            name="fk_game_stage",
+        ),
+        nullable=True,
     )
     patch_id: Mapped[str] = mapped_column(
         String(20),

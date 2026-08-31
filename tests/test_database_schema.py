@@ -58,9 +58,146 @@ def test_core_constraint_counts() -> None:
     )
 
     assert primary_key_count == 13
-    assert foreign_key_count == 15
+    assert foreign_key_count == 17
     assert check_constraint_count == 8
-    assert unique_constraint_count == 3
+    assert unique_constraint_count == 5
+
+
+def test_oracle_identity_columns_are_nullable_and_unique() -> None:
+    inspector = inspect(engine)
+    team_columns = {
+        column["name"]: column for column in inspector.get_columns("team")
+    }
+    player_columns = {
+        column["name"]: column for column in inspector.get_columns("player")
+    }
+
+    assert team_columns["oracle_team_id"]["nullable"] is True
+    assert player_columns["oracle_player_id"]["nullable"] is True
+
+    team_unique_constraint = next(
+        (
+            constraint
+            for constraint in inspector.get_unique_constraints("team")
+            if tuple(constraint.get("column_names") or ())
+            == ("oracle_team_id",)
+        ),
+        None,
+    )
+    player_unique_constraint = next(
+        (
+            constraint
+            for constraint in inspector.get_unique_constraints("player")
+            if tuple(constraint.get("column_names") or ())
+            == ("oracle_player_id",)
+        ),
+        None,
+    )
+
+    assert team_unique_constraint is not None
+    assert team_unique_constraint["name"] == "uq_team_oracle_team_id"
+    assert player_unique_constraint is not None
+    assert player_unique_constraint["name"] == "uq_player_oracle_player_id"
+
+
+def test_tournament_region_is_nullable() -> None:
+    inspector = inspect(engine)
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("tournament")
+    }
+
+    assert columns["region"]["nullable"] is True
+
+
+def test_game_has_exactly_one_series_or_stage_parent() -> None:
+    inspector = inspect(engine)
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("game")
+    }
+    foreign_keys = inspector.get_foreign_keys("game")
+    check_constraints = inspector.get_check_constraints("game")
+
+    assert columns["series_id"]["nullable"] is True
+    assert columns["stage_id"]["nullable"] is True
+
+    series_foreign_key = next(
+        (
+            foreign_key
+            for foreign_key in foreign_keys
+            if tuple(foreign_key.get("constrained_columns") or ())
+            == ("series_id",)
+            and foreign_key.get("referred_table") == "series"
+            and tuple(foreign_key.get("referred_columns") or ())
+            == ("series_id",)
+        ),
+        None,
+    )
+    stage_foreign_key = next(
+        (
+            foreign_key
+            for foreign_key in foreign_keys
+            if tuple(foreign_key.get("constrained_columns") or ())
+            == ("stage_id",)
+            and foreign_key.get("referred_table") == "tournament_stage"
+            and tuple(foreign_key.get("referred_columns") or ())
+            == ("stage_id",)
+        ),
+        None,
+    )
+    parent_check = next(
+        (
+            constraint
+            for constraint in check_constraints
+            if constraint.get("name") == "ck_game_exactly_one_parent"
+        ),
+        None,
+    )
+
+    assert series_foreign_key is not None
+    assert stage_foreign_key is not None
+    assert stage_foreign_key["name"] == "fk_game_stage"
+    assert parent_check is not None
+
+    sql_text = str(parent_check.get("sqltext", "")).lower()
+    sql_text = " ".join(
+        sql_text.replace("(", " ").replace(")", " ").split()
+    )
+    assert (
+        "series_id is not null and stage_id is null or "
+        "series_id is null and stage_id is not null"
+    ) in sql_text
+
+
+def test_game_winner_constraint_uses_participating_team() -> None:
+    inspector = inspect(engine)
+    check_constraint_names = {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints("game")
+    }
+    foreign_keys = inspector.get_foreign_keys("game")
+    winner_foreign_key = next(
+        (
+            foreign_key
+            for foreign_key in foreign_keys
+            if tuple(foreign_key.get("constrained_columns") or ())
+            == ("game_id", "winner_team_id")
+            and foreign_key.get("referred_table") == "game_team"
+            and tuple(foreign_key.get("referred_columns") or ())
+            == ("game_id", "team_id")
+        ),
+        None,
+    )
+
+    assert "ck_game_winner_requires_end" not in check_constraint_names
+    assert winner_foreign_key is not None
+    assert winner_foreign_key["name"] == "fk_game_winner_participant"
+
+    options = winner_foreign_key.get("options") or {}
+
+    assert options.get("deferrable") is True
+    assert str(options.get("initially", "")).upper() == "DEFERRED"
 
 
 def test_pre_evaluation_foreign_key_exists() -> None:
