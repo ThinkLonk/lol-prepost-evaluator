@@ -37,6 +37,7 @@ from match_insight.data_processing.oracle_transform import (
     GAME_TRANSFORM_BLOCKED,
     GAME_TRANSFORM_PARTIAL,
     GAME_TRANSFORM_READY,
+    ROLE_MAP,
     OracleDryRunResult,
     OracleTargetSnapshot,
     analyze_series_evidence,
@@ -98,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Write the five approved Step 6E reports under this directory. "
+            "Write the six approved Step 6E reports under this directory. "
             "If omitted, the command remains console-only."
         ),
     )
@@ -434,6 +435,7 @@ def validate_reconciliation(
     transformed = _summary_mapping(summary, "transformed_records")
     actions = _summary_mapping(summary, "actions")
     _summary_mapping(summary, "game_metadata_detail_counts")
+    _summary_mapping(summary, "primary_rejection_reason_counts")
     _summary_mapping(summary, "series_diagnostic_reason_counts")
     failed: list[str] = []
 
@@ -465,6 +467,10 @@ def validate_reconciliation(
             == len(result.unresolved_records),
             "rejected": int(summary.get("rejected", -1))
             == len(result.rejected_records),
+            "primary_rejected_games": int(
+                summary.get("primary_rejected_games", -1)
+            )
+            == len(result.rejected_games),
             "unmapped_champions": int(
                 summary.get("unmapped_champions", -1)
             )
@@ -480,7 +486,12 @@ def validate_reconciliation(
         parent_counts = games[["series_id", "stage_id"]].notna().sum(axis=1)
         if bool(parent_counts.ne(1).any()):
             failed.append("game_parent_xor")
-        if bool(games[["started_at", "ended_at"]].notna().any().any()):
+        if bool(
+            games[["scheduled_at", "started_at", "ended_at"]]
+            .notna()
+            .any()
+            .any()
+        ):
             failed.append("game_source_time_policy")
         if bool(games.duplicated(subset=["game_id"]).any()):
             failed.append("duplicate_game")
@@ -503,14 +514,59 @@ def validate_reconciliation(
         failed.append("duplicate_game_side")
     if bool(game_teams.duplicated(subset=["game_id", "team_id"]).any()):
         failed.append("duplicate_game_team")
+    for _, group in game_teams.groupby("game_id", sort=False, dropna=False):
+        if set(group["side"].astype(str)) != {"BLUE", "RED"}:
+            failed.append("game_side_set")
+
+    if not games.empty:
+        winner_membership = games[["game_id", "winner_team_id"]].merge(
+            game_teams[["game_id", "team_id"]],
+            left_on=["game_id", "winner_team_id"],
+            right_on=["game_id", "team_id"],
+            how="left",
+        )
+        if bool(winner_membership["team_id"].isna().any()):
+            failed.append("winner_team_membership")
 
     game_players = records.game_players
+    if len(game_players) != 10 * len(games):
+        failed.append("game_player_cardinality")
+    if bool(game_players["champion_id"].isna().any()):
+        failed.append("game_player_champion_required")
     if bool(
         game_players.duplicated(
             subset=["game_id", "side", "role"]
         ).any()
     ):
         failed.append("duplicate_game_team_role")
+    if not game_players.empty:
+        unique_players = game_players.groupby("game_id")["player_id"].nunique()
+        if bool(unique_players.ne(10).any()):
+            failed.append("game_unique_players")
+        expected_roles = set(ROLE_MAP.values())
+        for _, group in game_players.groupby(
+            ["game_id", "side"],
+            sort=False,
+            dropna=False,
+        ):
+            if (
+                len(group) != 5
+                or set(group["role"].astype(str)) != expected_roles
+            ):
+                failed.append("game_side_role_set")
+
+    rejected_game_ids = result.rejected_games["gameid"].astype(str)
+    accepted_game_ids = set(games["game_id"].astype(str))
+    if bool(rejected_game_ids.duplicated().any()):
+        failed.append("duplicate_primary_rejection")
+    if accepted_game_ids & set(rejected_game_ids):
+        failed.append("accepted_rejected_overlap")
+    if len(accepted_game_ids) + len(rejected_game_ids) != source_games:
+        failed.append("game_disposition_count")
+
+    stages = records.tournament_stages
+    if bool(stages["name"].eq("UNSPECIFIED").any()):
+        failed.append("unspecified_stage")
 
     if failed:
         raise ValueError(
@@ -604,6 +660,11 @@ def print_inspection_result(
     print(
         "rejected_reason_counts="
         f"{_json_value(summary['rejected_reason_counts'])}"
+    )
+    print(f"primary_rejected_games={summary['primary_rejected_games']}")
+    print(
+        "primary_rejection_reason_counts="
+        f"{_json_value(summary['primary_rejection_reason_counts'])}"
     )
     print(f"unmapped_champions={summary['unmapped_champions']}")
     print(

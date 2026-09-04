@@ -131,18 +131,56 @@ def test_empty_team_source_is_rejected() -> None:
         resolve_team_identities(empty)
 
 
-def test_team_recovers_only_from_unique_canonical_name() -> None:
+def test_team_name_only_is_not_enough_to_resolve() -> None:
+    dataframe = make_frame(
+        [
+            make_row(
+                gameid="GAME-SEED",
+                teamid="TEAM-UNIQUE",
+                teamname="Shared Team",
+                league="LEAGUE-A",
+                date="2025-01-01T12:00:00Z",
+            ),
+            make_row(
+                gameid="GAME-MISSING",
+                teamid=None,
+                teamname="Shared Team",
+                league="LEAGUE-B",
+                date="2025-01-02T12:00:00Z",
+            ),
+        ]
+    )
+
+    resolved = resolve_team_identities(dataframe)
+    missing_group = resolved.loc[
+        resolved["gameid"].eq("GAME-MISSING")
+    ].iloc[0]
+
+    assert pd.isna(
+        missing_group["resolved_oracle_team_id"]
+    )
+    assert missing_group["team_resolution_method"] == (
+        UNRESOLVED
+    )
+    assert missing_group["team_resolution_reason"] == (
+        "NO_SOURCE_ID_CANDIDATE"
+    )
+
+
+def test_team_recovers_only_from_unique_full_context() -> None:
     dataframe = make_frame(
         [
             make_row(
                 gameid="GAME-SEED",
                 teamid="TEAM-UNIQUE",
                 teamname="Téam One",
+                date="2025-01-01T01:00:00Z",
             ),
             make_row(
                 gameid="GAME-MISSING",
                 teamid=None,
                 teamname="  TÉAM   ONE  ",
+                date="2025-01-01T23:00:00Z",
             ),
         ]
     )
@@ -159,7 +197,7 @@ def test_team_recovers_only_from_unique_canonical_name() -> None:
         RECOVERED_UNIQUE
     )
     assert recovered["team_resolution_reason"] == (
-        "UNIQUE_CANONICAL_NAME"
+        "UNIQUE_FULL_CONTEXT"
     )
 
 
@@ -188,30 +226,47 @@ def test_team_source_id_conflict_is_unresolved() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("include_ambiguous_evidence", "expected_reason"),
-    [
-        (True, "AMBIGUOUS_SOURCE_ID_CANDIDATES"),
-        (False, "NO_SOURCE_ID_CANDIDATE"),
-    ],
-)
-def test_team_without_unique_name_candidate_is_unresolved(
-    include_ambiguous_evidence: bool,
-    expected_reason: str,
-) -> None:
-    rows = [
-        make_row(
-            gameid="GAME-MISSING",
-            teamid=None,
-            teamname=(
-                "Shared Team"
-                if include_ambiguous_evidence
-                else "Unknown Team"
-            ),
+def test_team_multiple_full_context_candidates_is_unresolved() -> None:
+    resolved = resolve_team_identities(
+        make_frame(
+            [
+                make_row(
+                    gameid="GAME-MISSING",
+                    teamid=None,
+                    teamname="Shared Team",
+                ),
+                make_row(
+                    gameid="GAME-A",
+                    teamid="TEAM-A",
+                    teamname="Shared Team",
+                ),
+                make_row(
+                    gameid="GAME-B",
+                    teamid="TEAM-B",
+                    teamname="Shared Team",
+                ),
+            ]
         )
-    ]
-    if include_ambiguous_evidence:
-        rows.extend(
+    )
+    missing_group = resolved.loc[
+        resolved["gameid"].eq("GAME-MISSING")
+    ].iloc[0]
+
+    assert missing_group["team_resolution_method"] == (
+        UNRESOLVED
+    )
+    assert missing_group["team_resolution_reason"] == (
+        "AMBIGUOUS_SOURCE_ID_CANDIDATES"
+    )
+    assert missing_group["team_resolution_candidates"] == (
+        "TEAM-A",
+        "TEAM-B",
+    )
+
+
+def test_direct_team_ids_conflicting_in_full_context_stay_unresolved() -> None:
+    resolved = resolve_team_identities(
+        make_frame(
             [
                 make_row(
                     gameid="GAME-A",
@@ -225,20 +280,70 @@ def test_team_without_unique_name_candidate_is_unresolved(
                 ),
             ]
         )
+    )
 
+    assert resolved["resolved_oracle_team_id"].isna().all()
+    assert set(resolved["team_resolution_method"]) == {UNRESOLVED}
+    assert set(resolved["team_resolution_reason"]) == {
+        "SOURCE_ID_CONFLICT"
+    }
+    assert set(resolved["team_resolution_candidates"]) == {
+        ("TEAM-A", "TEAM-B")
+    }
+
+
+def test_team_recovery_does_not_cross_source_observation_days() -> None:
     resolved = resolve_team_identities(
-        make_frame(rows)
+        make_frame(
+            [
+                make_row(
+                    gameid="GAME-SEED",
+                    teamid="TEAM-A",
+                    teamname="Shared Team",
+                    date="2025-01-01T23:59:00Z",
+                ),
+                make_row(
+                    gameid="GAME-MISSING",
+                    teamid=None,
+                    teamname="Shared Team",
+                    date="2025-01-02T00:01:00Z",
+                ),
+            ]
+        )
     )
     missing_group = resolved.loc[
         resolved["gameid"].eq("GAME-MISSING")
     ].iloc[0]
 
-    assert missing_group["team_resolution_method"] == (
-        UNRESOLVED
-    )
+    assert pd.isna(missing_group["resolved_oracle_team_id"])
+    assert missing_group["team_resolution_method"] == UNRESOLVED
     assert missing_group["team_resolution_reason"] == (
-        expected_reason
+        "NO_SOURCE_ID_CANDIDATE"
     )
+
+
+def test_team_without_full_context_candidate_is_unresolved() -> None:
+    resolved = resolve_team_identities(
+        make_frame(
+            [
+                make_row(
+                    gameid="GAME-MISSING",
+                    teamid=None,
+                    teamname="Unknown Team",
+                )
+            ]
+        )
+    )
+    missing_group = resolved.iloc[0]
+
+    assert pd.isna(
+        missing_group["resolved_oracle_team_id"]
+    )
+    assert missing_group["team_resolution_method"] == UNRESOLVED
+    assert missing_group["team_resolution_reason"] == (
+        "NO_SOURCE_ID_CANDIDATE"
+    )
+    assert missing_group["team_resolution_candidates"] == ()
 
 
 def test_player_source_id_has_priority_and_is_preserved() -> None:
@@ -532,6 +637,39 @@ def test_target_mapping_requires_exact_oracle_id() -> None:
         TARGET_NEW_REQUIRED
     )
     assert pd.isna(name_player["target_player_id"])
+
+
+def test_target_team_display_name_is_not_identity_evidence() -> None:
+    dataframe = make_frame(
+        [
+            make_row(
+                gameid="GAME-MISSING",
+                teamid=None,
+                teamname="Display Match",
+            )
+        ]
+    )
+    references = (
+        TeamEntityReference(
+            team_id="target-name-only",
+            oracle_team_id=None,
+            canonical_name="Display Match",
+            display_name="Display Match",
+        ),
+    )
+
+    resolved = resolve_team_identities(
+        dataframe,
+        references=references,
+    )
+    row = resolved.iloc[0]
+
+    assert pd.isna(row["resolved_oracle_team_id"])
+    assert row["team_resolution_method"] == UNRESOLVED
+    assert row["team_resolution_reason"] == (
+        "NO_SOURCE_ID_CANDIDATE"
+    )
+    assert pd.isna(row["target_team_id"])
 
 
 def test_duplicate_target_oracle_id_is_a_conflict() -> None:

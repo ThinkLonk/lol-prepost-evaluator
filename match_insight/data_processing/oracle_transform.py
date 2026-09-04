@@ -8,6 +8,7 @@ opens a database connection.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -48,6 +49,15 @@ TARGET_TABLE_ORDER: Final[tuple[str, ...]] = (
     "game_team",
     "game_player",
 )
+
+# Apply uses COALESCE for these fields.  Dry-run comparison must mirror that
+# existing contract so a NULL candidate does not forecast a write that apply
+# would preserve.
+PRESERVE_ON_NULL_COLUMNS: Final[dict[str, frozenset[str]]] = {
+    "team": frozenset({"logo_file"}),
+    "player": frozenset({"photo_file"}),
+    "game": frozenset({"started_at", "ended_at"}),
+}
 
 SIDE_MAP: Final[dict[str, str]] = {
     "blue": "BLUE",
@@ -143,6 +153,20 @@ UNMAPPED_CHAMPION_COLUMNS: Final[tuple[str, ...]] = (
     "champion",
     "reason",
 )
+REJECTED_GAME_COLUMNS: Final[tuple[str, ...]] = (
+    "gameid",
+    "primary_reason",
+    "secondary_reasons",
+    "league",
+    "source_year",
+    "calendar_date",
+    "patch",
+    "split",
+    "datacompleteness",
+    "blue_team",
+    "red_team",
+    "detail",
+)
 
 _SERIES_RECORD_COLUMNS: Final[tuple[str, ...]] = (
     "series_id",
@@ -186,6 +210,7 @@ _URL_BEST_OF_PARAMETERS: Final[tuple[str, ...]] = (
     "best_of",
     "bo",
 )
+_EXPECTED_ROLES: Final[frozenset[str]] = frozenset(ROLE_MAP.values())
 
 
 def _empty_frame(columns: tuple[str, ...]) -> pd.DataFrame:
@@ -262,6 +287,9 @@ class OracleDryRunResult:
     series_analysis: OracleSeriesAnalysis
     actions: pd.DataFrame
     source_counts: dict[str, int]
+    rejected_games: pd.DataFrame = field(
+        default_factory=lambda: _empty_frame(REJECTED_GAME_COLUMNS)
+    )
 
 
 def _is_missing(value: object) -> bool:
@@ -395,9 +423,13 @@ def _collapse_game_metadata(
     records: list[dict[str, object]] = []
     rejected: list[dict[str, str]] = []
     missing_gameid = source["gameid"].map(_is_missing)
-    for row_index in source.index[missing_gameid].tolist():
-        rejected.append(
-            _issue("game", row_index, "MISSING_GAME_ID", "gameid is required.")
+    if bool(missing_gameid.any()):
+        sample_indices = source.index[missing_gameid].tolist()[:20]
+        raise ValueError(
+            "Oracle transform cannot establish game grain because gameid is "
+            f"missing for {int(missing_gameid.sum())} source row(s); "
+            f"sample_indices={sample_indices}. No source or target ID was "
+            "fabricated."
         )
 
     grouped = source.loc[~missing_gameid].groupby(
@@ -1306,6 +1338,137 @@ def _unmapped_champions(identities: OracleIdentityResult) -> pd.DataFrame:
     return _records_frame(rows, UNMAPPED_CHAMPION_COLUMNS)
 
 
+def _analyze_game_lineups(
+    games: pd.DataFrame,
+    identities: OracleIdentityResult,
+    *,
+    player_targets: dict[str, str],
+) -> tuple[dict[str, tuple[str, ...]], list[dict[str, str]]]:
+    """Validate a complete lineup before emitting any row for its game."""
+    player_groups = {
+        str(gameid): group
+        for gameid, group in identities.player_rows.groupby(
+            "gameid",
+            sort=False,
+            dropna=False,
+        )
+    }
+    empty_group = identities.player_rows.iloc[0:0]
+    blocking_by_game: dict[str, tuple[str, ...]] = {}
+    diagnostics: list[dict[str, str]] = []
+
+    for gameid_value in games["gameid"].tolist():
+        gameid = str(gameid_value)
+        group = player_groups.get(gameid, empty_group)
+        game_codes: set[str] = set()
+        valid_rows: list[tuple[str, str, str, str]] = []
+
+        for row in group.itertuples(index=True):
+            source_key = f"{gameid}|{row.side}|{row.position}|{row.Index}"
+            row_codes: set[str] = set()
+            side_text = _text_or_none(row.side)
+            role_text = _text_or_none(row.position)
+            side = SIDE_MAP.get((side_text or "").casefold())
+            role = ROLE_MAP.get((role_text or "").casefold())
+
+            if side is None:
+                row_codes.add("INVALID_SIDE")
+            if role is None:
+                row_codes.add("INVALID_ROLE")
+
+            participant_value = row.participantid
+            participant_id = (
+                None
+                if _is_missing(participant_value)
+                else str(participant_value)
+            )
+            if participant_id is None:
+                row_codes.add("MISSING_PARTICIPANT_ID")
+
+            oracle_player_id = row.resolved_oracle_player_id
+            if _is_missing(oracle_player_id):
+                if _is_missing(row.playerid):
+                    row_codes.add("MISSING_PLAYER_ID")
+                row_codes.add(
+                    _text_or_none(row.player_resolution_reason)
+                    or "PLAYER_ID_UNRESOLVED"
+                )
+                player_id = None
+            else:
+                player_id = player_targets.get(str(oracle_player_id))
+                if player_id is None:
+                    row_codes.add("PLAYER_TARGET_UNRESOLVED")
+
+            champion_mapped = (
+                row.champion_mapping_status == CHAMPION_MAPPED
+                and not _is_missing(row.champion_id)
+            )
+            if not champion_mapped:
+                row_codes.add("CHAMPION_UNMAPPED")
+                champion_reason = _text_or_none(row.champion_mapping_reason)
+                if champion_reason is not None:
+                    row_codes.add(champion_reason)
+
+            if row_codes:
+                game_codes.update(row_codes)
+                diagnostics.extend(
+                    _issue(
+                        "game_player",
+                        source_key,
+                        code,
+                        "Lineup preflight failed for this source row.",
+                    )
+                    for code in sorted(row_codes)
+                )
+                continue
+
+            if (
+                side is None
+                or role is None
+                or player_id is None
+                or participant_id is None
+            ):
+                raise AssertionError("Validated lineup row lost a required value.")
+            valid_rows.append((side, role, player_id, participant_id))
+
+        if len(valid_rows) != 10:
+            game_codes.add("GAME_REQUIRES_TEN_RESOLVED_PLAYERS")
+        if len({row[2] for row in valid_rows}) != 10:
+            game_codes.add("GAME_REQUIRES_TEN_UNIQUE_PLAYERS")
+        if len({row[3] for row in valid_rows}) != 10:
+            game_codes.add("DUPLICATE_GAME_PARTICIPANT_ID")
+
+        for side in ("BLUE", "RED"):
+            side_rows = [row for row in valid_rows if row[0] == side]
+            roles = [row[1] for row in side_rows]
+            if (
+                len(side_rows) != 5
+                or set(roles) != _EXPECTED_ROLES
+                or len(roles) != len(set(roles))
+            ):
+                game_codes.add("TEAM_ROLE_SET_INCOMPLETE")
+                diagnostics.append(
+                    _issue(
+                        "game_player",
+                        f"{gameid}|{side}",
+                        "TEAM_ROLE_SET_INCOMPLETE",
+                        json.dumps(
+                            {
+                                "observed_roles": sorted(set(roles)),
+                                "required_roles": sorted(_EXPECTED_ROLES),
+                                "row_count": len(side_rows),
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+                )
+
+        if game_codes:
+            blocking_by_game[gameid] = tuple(sorted(game_codes))
+
+    return blocking_by_game, diagnostics
+
+
 def _build_game_records(
     games: pd.DataFrame,
     identities: OracleIdentityResult,
@@ -1314,6 +1477,7 @@ def _build_game_records(
     stage_ids: dict[tuple[str, int, str | None, int], str],
     series_analysis: OracleSeriesAnalysis,
     available_series_ids: set[str],
+    lineup_reasons_by_game: dict[str, tuple[str, ...]],
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -1405,13 +1569,20 @@ def _build_game_records(
         if not has_exactly_one_parent:
             reasons.append("GAME_PARENT_UNRESOLVED")
 
-        if reasons:
+        lineup_reasons = lineup_reasons_by_game.get(gameid, ())
+        primary_reason: str | None = None
+        if lineup_reasons:
+            primary_reason = "GAME_LINEUP_INCOMPLETE"
+        elif reasons:
+            primary_reason = "GAME_DEPENDENCY_INVALID"
+
+        if primary_reason is not None:
             rejected.append(
                 _issue(
                     "game",
                     gameid,
-                    "GAME_DEPENDENCY_INVALID",
-                    ",".join(sorted(set(reasons))),
+                    primary_reason,
+                    ",".join(sorted(set(reasons) | set(lineup_reasons))),
                 )
             )
             continue
@@ -1424,7 +1595,7 @@ def _build_game_records(
                 "stage_id": direct_stage_id,
                 "patch_id": str(game.patch),
                 "game_number": int(game.game),
-                "scheduled_at": game.date,
+                "scheduled_at": None,
                 "started_at": None,
                 "ended_at": None,
                 "winner_team_id": winners[0],
@@ -1440,12 +1611,17 @@ def _build_game_records(
                 }
             )
 
-    return (
-        _records_frame(result_rows, GAME_COLUMNS),
-        _records_frame(team_records, GAME_TEAM_COLUMNS),
-        accepted_games,
-        rejected,
-    )
+    game_frame = _records_frame(result_rows, GAME_COLUMNS)
+    team_frame = _records_frame(team_records, GAME_TEAM_COLUMNS)
+    if len(team_frame) != 2 * len(accepted_games):
+        raise ValueError("Accepted games must emit two game_team rows each.")
+    if not team_frame.empty:
+        if bool(team_frame.duplicated(subset=["game_id", "side"]).any()):
+            raise ValueError("Accepted games contain duplicate game-side rows.")
+        if bool(team_frame.duplicated(subset=["game_id", "team_id"]).any()):
+            raise ValueError("Accepted games contain duplicate game-team rows.")
+
+    return game_frame, team_frame, accepted_games, rejected
 
 
 def _attach_team_results(
@@ -1473,10 +1649,9 @@ def _build_game_player_records(
     *,
     accepted_games: set[str],
     player_targets: dict[str, str],
-) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+) -> pd.DataFrame:
     records: list[dict[str, object]] = []
-    rejected: list[dict[str, str]] = []
-    for row in identities.player_rows.itertuples(index=True):
+    for row in identities.player_rows.itertuples(index=False):
         gameid = str(row.gameid)
         if gameid not in accepted_games:
             continue
@@ -1490,106 +1665,46 @@ def _build_game_player_records(
             if _is_missing(oracle_player_id)
             else player_targets.get(str(oracle_player_id))
         )
-        source_key = f"{gameid}|{row.side}|{row.position}|{row.Index}"
-        reasons: list[str] = []
-        if side is None:
-            reasons.append("INVALID_SIDE")
-        if role is None:
-            reasons.append("INVALID_ROLE")
-        source_identity_unresolved = _is_missing(oracle_player_id)
-        if player_id is None and not source_identity_unresolved:
-            reasons.append("PLAYER_TARGET_UNRESOLVED")
-        if reasons:
-            rejected.append(
-                _issue(
-                    "game_player",
-                    source_key,
-                    "GAME_PLAYER_DEPENDENCY_INVALID",
-                    ",".join(sorted(reasons)),
-                )
-            )
-            continue
-        if source_identity_unresolved:
-            # The identity resolver already records this row in the
-            # unresolved category.  Do not duplicate it as rejected.
-            continue
-
         champion_id = row.champion_id
-        champion_mapped = row.champion_mapping_status == CHAMPION_MAPPED
+        champion_mapped = (
+            row.champion_mapping_status == CHAMPION_MAPPED
+            and not _is_missing(champion_id)
+        )
+        if (
+            side is None
+            or role is None
+            or player_id is None
+            or not champion_mapped
+        ):
+            raise ValueError(
+                "Accepted game failed lineup preflight: "
+                f"{gameid}|{row.side}|{row.position}"
+            )
         records.append(
             {
                 "game_id": gameid,
                 "side": side,
                 "player_id": player_id,
                 "role": role,
-                "champion_id": (
-                    str(champion_id)
-                    if champion_mapped and not _is_missing(champion_id)
-                    else None
-                ),
-                "confirmation_status": (
-                    SOURCE_REPORTED
-                    if champion_mapped
-                    else SOURCE_CHAMPION_UNMAPPED
-                ),
+                "champion_id": str(champion_id),
+                "confirmation_status": SOURCE_REPORTED,
             }
         )
 
     frame = _records_frame(records, GAME_PLAYER_COLUMNS)
+    if len(frame) != 10 * len(accepted_games):
+        raise ValueError("Accepted games must emit ten game_player rows each.")
     if not frame.empty:
-        duplicate_mask = frame.duplicated(
-            subset=["game_id", "side", "role"],
-            keep=False,
-        )
-        for row in frame.loc[duplicate_mask].itertuples(index=False):
-            rejected.append(
-                _issue(
-                    "game_player",
-                    f"{row.game_id}|{row.side}|{row.role}",
-                    "DUPLICATE_GAME_TEAM_ROLE",
-                    "",
-                )
-            )
-        frame = frame.loc[~duplicate_mask].reset_index(drop=True)
-
-    if not frame.empty:
-        expected_roles = set(ROLE_MAP.values())
-        invalid_keys: set[tuple[str, str]] = set()
-        for (game_id, side), group in frame.groupby(
-            ["game_id", "side"],
-            sort=False,
-            dropna=False,
+        if bool(
+            frame.duplicated(subset=["game_id", "side", "role"]).any()
         ):
-            observed_roles = set(group["role"].astype(str).tolist())
-            if len(group) != 5 or observed_roles != expected_roles:
-                key = (str(game_id), str(side))
-                invalid_keys.add(key)
-                rejected.append(
-                    _issue(
-                        "game_player",
-                        f"{key[0]}|{key[1]}",
-                        "GAME_TEAM_ROLES_INCOMPLETE",
-                        repr(sorted(observed_roles)),
-                    )
-                )
-        if invalid_keys:
-            for row in frame.itertuples(index=False):
-                key = (str(row.game_id), str(row.side))
-                if key in invalid_keys:
-                    rejected.append(
-                        _issue(
-                            "game_player",
-                            f"{key[0]}|{key[1]}|{row.role}",
-                            "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET",
-                            "The five-role set for this game side is incomplete.",
-                        )
-                    )
-            keep_mask = [
-                (str(row.game_id), str(row.side)) not in invalid_keys
-                for row in frame.itertuples(index=False)
-            ]
-            frame = frame.loc[keep_mask].reset_index(drop=True)
-    return frame, rejected
+            raise ValueError("Accepted games contain duplicate side-role rows.")
+        if bool(frame["champion_id"].isna().any()):
+            raise ValueError("Accepted games contain NULL champion_id.")
+        unique_players = frame.groupby("game_id")["player_id"].nunique()
+        if bool(unique_players.ne(10).any()):
+            raise ValueError("Accepted games require ten unique players.")
+    return frame
 
 
 def _game_dependency_cascade_issues(
@@ -1623,6 +1738,125 @@ def _game_dependency_cascade_issues(
             )
         )
     return issues
+
+
+def _artifact_value(
+    group: pd.DataFrame,
+    column: str,
+    *,
+    calendar_date: bool = False,
+    integer: bool = False,
+) -> object:
+    values: list[object] = []
+    for value in group[column].tolist():
+        if _is_missing(value):
+            continue
+        if calendar_date:
+            rendered: object = pd.Timestamp(value).date().isoformat()
+        elif integer:
+            rendered = int(value)
+        else:
+            rendered = _text_or_none(value)
+        if rendered is not None and rendered not in values:
+            values.append(rendered)
+
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return json.dumps(values, ensure_ascii=False, default=str)
+
+
+def _artifact_team_name(group: pd.DataFrame, side: str) -> object:
+    normalized_sides = group["side"].astype("string").str.casefold()
+    side_group = group.loc[
+        normalized_sides.eq(side.casefold()).fillna(False)
+    ]
+    return _artifact_value(side_group, "teamname")
+
+
+def _secondary_codes(detail: object) -> list[str]:
+    text = _text_or_none(detail)
+    if text is None:
+        return []
+    return sorted({code.strip() for code in text.split(",") if code.strip()})
+
+
+def _build_rejected_game_records(
+    core_data: OracleCoreData,
+    *,
+    accepted_games: set[str],
+    primary_game_issues: list[dict[str, str]],
+) -> pd.DataFrame:
+    """Build one additive primary-disposition row per rejected source game."""
+    source = core_data.dataframe
+    valid_source = source.loc[~source["gameid"].map(_is_missing)]
+    groups = {
+        str(gameid): group
+        for gameid, group in valid_source.groupby(
+            "gameid",
+            sort=False,
+            dropna=False,
+        )
+    }
+    source_game_ids = set(groups)
+    primary_by_game: dict[str, dict[str, str]] = {}
+    for issue in primary_game_issues:
+        gameid = str(issue["source_key"])
+        if gameid not in source_game_ids:
+            continue
+        if gameid in primary_by_game:
+            raise ValueError(f"Game has multiple primary rejections: {gameid}")
+        primary_by_game[gameid] = issue
+
+    rejected_game_ids = set(primary_by_game)
+    overlap = accepted_games & rejected_game_ids
+    if overlap:
+        raise ValueError(
+            "Games cannot be both accepted and rejected: "
+            + ", ".join(sorted(overlap)[:20])
+        )
+
+    unclassified = source_game_ids - accepted_games - rejected_game_ids
+    if unclassified:
+        raise ValueError(
+            "Source games lack a final disposition: "
+            + ", ".join(sorted(unclassified)[:20])
+        )
+
+    rows: list[dict[str, object]] = []
+    for gameid in sorted(rejected_game_ids):
+        group = groups[gameid]
+        issue = primary_by_game[gameid]
+        detail = issue["detail"]
+        rows.append(
+            {
+                "gameid": gameid,
+                "primary_reason": issue["reason"],
+                "secondary_reasons": json.dumps(
+                    _secondary_codes(detail),
+                    ensure_ascii=False,
+                ),
+                "league": _artifact_value(group, "league"),
+                "source_year": _artifact_value(group, "year", integer=True),
+                "calendar_date": _artifact_value(
+                    group,
+                    "date",
+                    calendar_date=True,
+                ),
+                "patch": _artifact_value(group, "patch"),
+                "split": _artifact_value(group, "split"),
+                "datacompleteness": _artifact_value(
+                    group,
+                    "datacompleteness",
+                ),
+                "blue_team": _artifact_team_name(group, "Blue"),
+                "red_team": _artifact_team_name(group, "Red"),
+                "detail": detail,
+            }
+        )
+
+    return _records_frame(rows, REJECTED_GAME_COLUMNS)
 
 
 def _build_series_targets(
@@ -1665,6 +1899,20 @@ def _missing_equal(left: object, right: object) -> bool:
     if _is_missing(left) or _is_missing(right):
         return False
     return left == right
+
+
+def _reconciliation_value_equal(
+    *,
+    table: str,
+    column: str,
+    candidate: object,
+    current: object,
+) -> bool:
+    """Compare with the protected apply module's preserve-on-null contract."""
+    preserved = PRESERVE_ON_NULL_COLUMNS.get(table, frozenset())
+    if column in preserved and _is_missing(candidate):
+        return True
+    return _missing_equal(candidate, current)
 
 
 def _game_team_side_index(
@@ -1796,7 +2044,12 @@ def _record_actions(
                 action = "INSERT"
             else:
                 unchanged = all(
-                    _missing_equal(row[column], current[column])
+                    _reconciliation_value_equal(
+                        table=table,
+                        column=column,
+                        candidate=row[column],
+                        current=current[column],
+                    )
                     for column in candidate.columns
                 )
                 action = "SKIP" if unchanged else "UPDATE"
@@ -1839,6 +2092,11 @@ def transform_oracle_targets(
         identities,
         snapshot,
     )
+    lineup_reasons_by_game, lineup_issues = _analyze_game_lineups(
+        games,
+        identities,
+        player_targets=player_targets,
+    )
     (
         game_patches,
         tournaments,
@@ -1857,9 +2115,10 @@ def transform_oracle_targets(
             stage_ids=stage_ids,
             series_analysis=analysis,
             available_series_ids=available_series_ids,
+            lineup_reasons_by_game=lineup_reasons_by_game,
         )
     )
-    game_players, game_player_issues = _build_game_player_records(
+    game_players = _build_game_player_records(
         identities,
         accepted_games=accepted_games,
         player_targets=player_targets,
@@ -1895,9 +2154,17 @@ def transform_oracle_targets(
     rejected.extend(player_entity_issues)
     rejected.extend(context_issues)
     rejected.extend(series_issues)
+    rejected.extend(lineup_issues)
     rejected.extend(game_issues)
-    rejected.extend(game_player_issues)
     rejected.extend(cascade_issues)
+
+    primary_game_issues = metadata_rejected.to_dict("records")
+    primary_game_issues.extend(game_issues)
+    rejected_games = _build_rejected_game_records(
+        core_data,
+        accepted_games=accepted_games,
+        primary_game_issues=primary_game_issues,
+    )
 
     return OracleDryRunResult(
         records=records,
@@ -1913,6 +2180,7 @@ def transform_oracle_targets(
             "team_rows": int(len(core_data.team_rows)),
             "distinct_games": int(core_data.dataframe["gameid"].nunique()),
         },
+        rejected_games=rejected_games,
     )
 
 
@@ -1964,6 +2232,13 @@ def build_dry_run_summary(result: OracleDryRunResult) -> dict[str, object]:
         .sort_index()
         .items()
     }
+    primary_rejection_reasons = {
+        str(key): int(value)
+        for key, value in result.rejected_games["primary_reason"]
+        .value_counts()
+        .sort_index()
+        .items()
+    }
     series_status_counts = {
         str(key): int(value)
         for key, value in result.series_analysis.game_assignments[
@@ -2003,6 +2278,8 @@ def build_dry_run_summary(result: OracleDryRunResult) -> dict[str, object]:
         "unresolved_reason_counts": unresolved_reasons,
         "rejected": int(len(result.rejected_records)),
         "rejected_reason_counts": rejected_reasons,
+        "primary_rejected_games": int(len(result.rejected_games)),
+        "primary_rejection_reason_counts": primary_rejection_reasons,
         "game_metadata_detail_counts": metadata_details,
         "unmapped_champions": int(len(result.unmapped_champions)),
         "series_status": result.series_analysis.status,

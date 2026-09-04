@@ -29,6 +29,8 @@ CHAMPION_UNMAPPED: Final[str] = "UNMAPPED"
 
 _SOURCE_ID_MAX_LENGTH: Final[int] = 64
 
+TeamContextKey = tuple[str, str, int, str | None, int, str]
+
 
 @dataclass(frozen=True)
 class TeamEntityReference:
@@ -157,12 +159,51 @@ def _raw_text_values(series: pd.Series) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _single_team_context_value(
+    group: pd.DataFrame,
+    column: str,
+    *,
+    required: bool,
+) -> tuple[object | None, str | None]:
+    """Collapse one context field without guessing across conflicting rows."""
+    values = group[column]
+    missing_mask = values.map(_is_missing)
+    non_missing = values.loc[~missing_mask].drop_duplicates()
+
+    if len(non_missing) > 1:
+        return None, f"CONFLICTING_{column.upper()}_CONTEXT"
+    if bool(missing_mask.any()) and len(non_missing) == 1:
+        return None, f"MIXED_MISSING_{column.upper()}_CONTEXT"
+    if non_missing.empty:
+        if required:
+            return None, f"MISSING_{column.upper()}_CONTEXT"
+        return None, None
+
+    return non_missing.iloc[0], None
+
+
+def _source_observation_day(value: object) -> str | None:
+    """Return the exact UTC source day; never infer a validity interval/cutoff."""
+    if _is_missing(value):
+        return None
+
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+
+    if timestamp.tzinfo is None:
+        return None
+
+    return timestamp.tz_convert("UTC").date().isoformat()
+
+
 def _team_group_snapshot(
     gameid: object,
     side: object,
     group: pd.DataFrame,
 ) -> dict[str, object]:
-    """Thu bằng chứng trực tiếp của một team participation."""
+    """Collect direct ID plus exact source context for one participation."""
     valid_source_ids: set[str] = set()
     invalid_source_id_rows = 0
 
@@ -177,9 +218,47 @@ def _team_group_snapshot(
     name_keys = {
         key
         for value in raw_teamnames
-        if (key := _canonical_key_or_none(value))
-        is not None
+        if (key := _canonical_key_or_none(value)) is not None
     }
+    context_values: dict[str, object | None] = {}
+    context_issues: list[str] = []
+
+    for column, required in (
+        ("league", True),
+        ("year", True),
+        ("split", False),
+        ("playoffs", True),
+        ("date", True),
+    ):
+        value, issue = _single_team_context_value(
+            group,
+            column,
+            required=required,
+        )
+        context_values[column] = value
+        if issue is not None:
+            context_issues.append(issue)
+
+    source_year: int | None = None
+    if context_values["year"] is not None:
+        try:
+            source_year = int(context_values["year"])
+        except (TypeError, ValueError):
+            context_issues.append("INVALID_YEAR_CONTEXT")
+
+    source_playoffs: int | None = None
+    if context_values["playoffs"] is not None:
+        try:
+            source_playoffs = int(context_values["playoffs"])
+        except (TypeError, ValueError):
+            context_issues.append("INVALID_PLAYOFFS_CONTEXT")
+        else:
+            if source_playoffs not in {0, 1}:
+                context_issues.append("INVALID_PLAYOFFS_CONTEXT")
+
+    observation_day = _source_observation_day(context_values["date"])
+    if context_values["date"] is not None and observation_day is None:
+        context_issues.append("INVALID_DATE_CONTEXT")
 
     return {
         "gameid": gameid,
@@ -199,6 +278,12 @@ def _team_group_snapshot(
         "invalid_source_teamid_rows": (
             invalid_source_id_rows
         ),
+        "source_league": context_values["league"],
+        "source_year": source_year,
+        "source_split": context_values["split"],
+        "source_playoffs": source_playoffs,
+        "source_observation_day": observation_day,
+        "team_context_issues": tuple(sorted(set(context_issues))),
     }
 
 
@@ -226,49 +311,88 @@ def _direct_team_resolution(
     return None
 
 
-def _team_name_evidence(
+def _team_context_key(
+    snapshot: dict[str, object],
+) -> tuple[TeamContextKey | None, str | None]:
+    """Build a fail-closed name/tournament/day key for team recovery."""
+    name_keys = tuple(snapshot["canonical_teamname_candidates"])
+    if not name_keys:
+        return None, "MISSING_TEAM_NAME"
+    if len(name_keys) > 1:
+        return None, "TEAM_NAME_CONFLICT"
+
+    context_issues = tuple(snapshot["team_context_issues"])
+    if context_issues:
+        return None, ",".join(context_issues)
+
+    league_key = _canonical_key_or_none(snapshot["source_league"])
+    split_value = snapshot["source_split"]
+    split_key = _canonical_key_or_none(split_value)
+    source_year = snapshot["source_year"]
+    source_playoffs = snapshot["source_playoffs"]
+    observation_day = snapshot["source_observation_day"]
+
+    if league_key is None:
+        return None, "MISSING_LEAGUE_CONTEXT"
+    if split_value is not None and split_key is None:
+        return None, "INVALID_SPLIT_CONTEXT"
+    if (
+        source_year is None
+        or source_playoffs is None
+        or observation_day is None
+    ):
+        return None, "INSUFFICIENT_TEAM_CONTEXT"
+
+    return (
+        (
+            str(name_keys[0]),
+            league_key,
+            int(source_year),
+            split_key,
+            int(source_playoffs),
+            str(observation_day),
+        ),
+        None,
+    )
+
+
+def _team_context_evidence(
     snapshots: list[dict[str, object]],
-) -> dict[str, set[str]]:
-    """Lập name→ID chỉ từ group có một source ID trực tiếp và một tên."""
-    evidence: dict[str, set[str]] = defaultdict(set)
+) -> dict[TeamContextKey, set[str]]:
+    """Index direct source IDs only by full, exact source context."""
+    evidence: dict[TeamContextKey, set[str]] = defaultdict(set)
 
     for snapshot in snapshots:
         direct = _direct_team_resolution(snapshot)
-        name_keys = tuple(
-            snapshot["canonical_teamname_candidates"]
-        )
-        if (
-            direct is None
-            or direct[1] != SOURCE_ID
-            or len(name_keys) != 1
-        ):
+        if direct is None or direct[1] != SOURCE_ID:
             continue
-        evidence[str(name_keys[0])].add(str(direct[0]))
+
+        context, _ = _team_context_key(snapshot)
+        if context is not None:
+            evidence[context].add(str(direct[0]))
 
     return evidence
 
 
-def _recover_team_from_name(
+def _recover_team_from_context(
     snapshot: dict[str, object],
-    evidence: dict[str, set[str]],
+    evidence: dict[TeamContextKey, set[str]],
 ) -> tuple[str | None, str, str, tuple[str, ...]]:
-    """Khôi phục team ID khi canonical name có đúng một candidate."""
-    name_keys = tuple(
-        snapshot["canonical_teamname_candidates"]
-    )
-    if not name_keys:
-        return None, UNRESOLVED, "MISSING_TEAM_NAME", ()
-    if len(name_keys) > 1:
-        return None, UNRESOLVED, "TEAM_NAME_CONFLICT", ()
+    """Recover only when the full exact context yields one source ID."""
+    context, reason = _team_context_key(snapshot)
+    if context is None:
+        if reason is None:
+            raise AssertionError("Missing team context must include a reason.")
+        return None, UNRESOLVED, reason, ()
 
     candidates = tuple(
-        sorted(evidence.get(str(name_keys[0]), set()))
+        sorted(evidence.get(context, set()))
     )
     if len(candidates) == 1:
         return (
             candidates[0],
             RECOVERED_UNIQUE,
-            "UNIQUE_CANONICAL_NAME",
+            "UNIQUE_FULL_CONTEXT",
             candidates,
         )
     if not candidates:
@@ -386,14 +510,24 @@ def resolve_team_identities(
     references: Sequence[TeamEntityReference] = (),
 ) -> pd.DataFrame:
     """Resolve team ở grain ``(gameid, side)`` mà không sửa input."""
-    _require_columns(
-        source_rows,
-        ("gameid", "side", "teamid", "teamname"),
-        frame_name="Oracle source rows",
-    )
-
     if source_rows.empty:
         raise ValueError("Oracle source rows cannot be empty.")
+
+    _require_columns(
+        source_rows,
+        (
+            "gameid",
+            "side",
+            "teamid",
+            "teamname",
+            "league",
+            "year",
+            "split",
+            "playoffs",
+            "date",
+        ),
+        frame_name="Oracle source rows",
+    )
 
     if bool(
         source_rows[["gameid", "side"]]
@@ -413,7 +547,7 @@ def resolve_team_identities(
             dropna=False,
         )
     ]
-    name_evidence = _team_name_evidence(snapshots)
+    context_evidence = _team_context_evidence(snapshots)
     records: list[dict[str, object]] = []
 
     for snapshot in snapshots:
@@ -421,29 +555,53 @@ def resolve_team_identities(
         candidate_ids = tuple(
             snapshot["source_teamid_candidates"]
         )
+        context, _ = _team_context_key(snapshot)
+        context_candidates = (
+            ()
+            if context is None
+            else tuple(sorted(context_evidence.get(context, set())))
+        )
 
         if direct is not None:
-            resolved_id, method, reason = direct
+            if direct[1] == SOURCE_ID and len(context_candidates) > 1:
+                resolved_id = None
+                method = UNRESOLVED
+                reason = "SOURCE_ID_CONFLICT"
+                candidate_ids = context_candidates
+            else:
+                resolved_id, method, reason = direct
         else:
             (
                 resolved_id,
                 method,
                 reason,
                 candidate_ids,
-            ) = _recover_team_from_name(
+            ) = _recover_team_from_context(
                 snapshot,
-                name_evidence,
+                context_evidence,
             )
 
         records.append(
             {
-                **snapshot,
+                "gameid": snapshot["gameid"],
+                "side": snapshot["side"],
+                "source_teamname": snapshot["source_teamname"],
+                "source_teamname_candidates": snapshot[
+                    "source_teamname_candidates"
+                ],
+                "canonical_teamname_candidates": snapshot[
+                    "canonical_teamname_candidates"
+                ],
+                "source_teamid_candidates": snapshot[
+                    "source_teamid_candidates"
+                ],
+                "invalid_source_teamid_rows": snapshot[
+                    "invalid_source_teamid_rows"
+                ],
                 "resolved_oracle_team_id": resolved_id,
                 "team_resolution_method": method,
                 "team_resolution_reason": reason,
-                "team_resolution_candidates": (
-                    candidate_ids
-                ),
+                "team_resolution_candidates": candidate_ids,
             }
         )
 

@@ -16,6 +16,7 @@ from match_insight.data_processing.oracle_transform import (
     GAME_TRANSFORM_PARTIAL,
     GAME_TRANSFORM_READY,
     ISSUE_COLUMNS,
+    REJECTED_GAME_COLUMNS,
     SERIES_READY,
     UNMAPPED_CHAMPION_COLUMNS,
     OracleDryRunResult,
@@ -29,16 +30,15 @@ UNMAPPED_CHAMPIONS_FILENAME: Final[str] = (
     "oracle_2025_unmapped_champions.csv"
 )
 REJECTED_RECORDS_FILENAME: Final[str] = "oracle_2025_rejected_records.csv"
+REJECTED_GAMES_FILENAME: Final[str] = "oracle_2025_rejected_games.csv"
 ETL_REPORT_FILENAME: Final[str] = "oracle_2025_etl_report.md"
 
 IDENTITY_ISSUE_ENTITIES: Final[frozenset[str]] = frozenset(
     {"team_participation", "player_row"}
 )
-
-_PLAYER_ROW_REJECTION_REASONS: Final[tuple[str, ...]] = (
-    "GAME_PLAYER_DEPENDENCY_INVALID",
-    "DUPLICATE_GAME_TEAM_ROLE",
-    "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET",
+_EXPECTED_SIDES: Final[frozenset[str]] = frozenset({"BLUE", "RED"})
+_EXPECTED_ROLES: Final[frozenset[str]] = frozenset(
+    {"TOP", "JUNGLE", "MID", "BOT", "SUPPORT"}
 )
 
 
@@ -73,41 +73,69 @@ def _issue_count(
     return int(mask.sum())
 
 
-def _accepted_player_identity_keys(result: OracleDryRunResult) -> set[str]:
-    accepted_game_ids = set(result.records.games["game_id"].astype(str))
-    if not accepted_game_ids or result.unresolved_records.empty:
-        return set()
-
-    unresolved_players = result.unresolved_records.loc[
-        result.unresolved_records["entity"].eq("player_row"),
-        "source_key",
-    ]
-    accepted_keys: set[str] = set()
-    for source_key in unresolved_players.tolist():
-        key = str(source_key)
-        parts = key.rsplit("|", 3)
-        if len(parts) == 4 and parts[0] in accepted_game_ids:
-            accepted_keys.add(key)
-    return accepted_keys
-
-
-def _issue_count_excluding_keys(
+def _child_integrity(
     dataframe: pd.DataFrame,
     *,
-    entity: str,
-    reason: str,
-    excluded_source_keys: set[str],
-) -> int:
-    if dataframe.empty:
-        return 0
-    required = {"entity", "source_key", "reason"}
-    if not required <= set(dataframe.columns):
-        missing = ", ".join(sorted(required - set(dataframe.columns)))
-        raise ValueError(f"Issue dataframe is missing columns: {missing}")
-    mask = dataframe["entity"].eq(entity) & dataframe["reason"].eq(reason)
-    if excluded_source_keys:
-        mask &= ~dataframe["source_key"].astype(str).isin(excluded_source_keys)
-    return int(mask.sum())
+    accepted_ids: set[str],
+    expected_keys: frozenset[tuple[str, ...]],
+    key_columns: tuple[str, ...],
+    identity_column: str,
+) -> dict[str, object]:
+    """Validate exact per-game child shape and parent membership."""
+    required = {"game_id", identity_column, *key_columns}
+    missing = sorted(required - set(dataframe.columns))
+    if missing:
+        raise ValueError(
+            "Target child dataframe is missing columns: " + ", ".join(missing)
+        )
+
+    parent_ids = dataframe["game_id"].astype("string")
+    missing_parent_rows = int(parent_ids.isna().sum())
+    parent_text = parent_ids.fillna("").astype(str)
+    orphan_mask = ~parent_text.isin(accepted_ids)
+    orphan_rows = int(orphan_mask.sum())
+    duplicate_keys = int(
+        dataframe.duplicated(subset=["game_id", *key_columns]).sum()
+    )
+    duplicate_identities = int(
+        dataframe.duplicated(subset=["game_id", identity_column]).sum()
+    )
+    invalid_games: list[str] = []
+
+    for game_id in sorted(accepted_ids):
+        game_rows = dataframe.loc[parent_text.eq(game_id)]
+        observed_keys = frozenset(
+            tuple(str(value) for value in row)
+            for row in game_rows.loc[:, list(key_columns)].itertuples(
+                index=False,
+                name=None,
+            )
+        )
+        identities = game_rows[identity_column].astype("string")
+        if (
+            len(game_rows) != len(expected_keys)
+            or observed_keys != expected_keys
+            or bool(identities.isna().any())
+            or bool(identities.duplicated().any())
+        ):
+            invalid_games.append(game_id)
+
+    valid = (
+        missing_parent_rows == 0
+        and orphan_rows == 0
+        and duplicate_keys == 0
+        and duplicate_identities == 0
+        and not invalid_games
+    )
+    return {
+        "orphan_rows": orphan_rows,
+        "missing_parent_rows": missing_parent_rows,
+        "duplicate_logical_keys": duplicate_keys,
+        "duplicate_identities": duplicate_identities,
+        "invalid_game_count": len(invalid_games),
+        "invalid_game_ids": invalid_games,
+        "valid": valid,
+    }
 
 
 def derive_dry_run_state(
@@ -142,83 +170,69 @@ def derive_dry_run_state(
 def build_grain_reconciliation(
     result: OracleDryRunResult,
 ) -> dict[str, object]:
-    """Partition source grains without treating group diagnostics as rows."""
+    """Reconcile unique game dispositions and their complete child grains."""
 
-    rejected = result.rejected_records
+    diagnostics = result.rejected_records
+    primary = result.rejected_games
     source_rows = int(result.source_counts["source_rows"])
     source_games = int(result.source_counts["distinct_games"])
     source_team_rows = int(result.source_counts["team_rows"])
     source_player_rows = int(result.source_counts["player_rows"])
-    classified_rows = source_team_rows + source_player_rows
 
-    transformed_games = int(len(result.records.games))
-    metadata_invalid = _issue_count(
-        rejected,
-        entity="game",
-        reason="GAME_METADATA_INVALID",
-    )
-    dependency_invalid = _issue_count(
-        rejected,
-        entity="game",
-        reason="GAME_DEPENDENCY_INVALID",
-    )
-    accounted_games = transformed_games + metadata_invalid + dependency_invalid
+    accepted_list = result.records.games["game_id"].astype(str).tolist()
+    accepted_ids = set(accepted_list)
+    rejected_list = primary["gameid"].astype(str).tolist()
+    rejected_ids = set(rejected_list)
+    duplicate_accepted = len(accepted_list) - len(accepted_ids)
+    duplicate_rejected = len(rejected_list) - len(rejected_ids)
+    overlap = len(accepted_ids & rejected_ids)
+    accounted_ids = accepted_ids | rejected_ids
+    transformed_games = len(accepted_list)
 
     transformed_team_rows = int(len(result.records.game_teams))
+    team_integrity = _child_integrity(
+        result.records.game_teams,
+        accepted_ids=accepted_ids,
+        expected_keys=frozenset((side,) for side in _EXPECTED_SIDES),
+        key_columns=("side",),
+        identity_column="team_id",
+    )
     team_parent_blocked = _issue_count(
-        rejected,
+        diagnostics,
         entity="game_team",
         reason="GAME_TEAM_BLOCKED_BY_GAME",
     )
     accounted_team_rows = transformed_team_rows + team_parent_blocked
 
     transformed_player_rows = int(len(result.records.game_players))
+    player_integrity = _child_integrity(
+        result.records.game_players,
+        accepted_ids=accepted_ids,
+        expected_keys=frozenset(
+            (side, role)
+            for side in _EXPECTED_SIDES
+            for role in _EXPECTED_ROLES
+        ),
+        key_columns=("side", "role"),
+        identity_column="player_id",
+    )
     player_parent_blocked = _issue_count(
-        rejected,
+        diagnostics,
         entity="game_player",
         reason="GAME_PLAYER_BLOCKED_BY_GAME",
     )
-    accepted_unresolved_keys = _accepted_player_identity_keys(result)
-    player_row_rejections = {
-        reason: _issue_count_excluding_keys(
-            rejected,
-            entity="game_player",
-            reason=reason,
-            excluded_source_keys=accepted_unresolved_keys,
-        )
-        for reason in _PLAYER_ROW_REJECTION_REASONS
-    }
-    raw_player_row_rejections = sum(
-        _issue_count(
-            rejected,
-            entity="game_player",
-            reason=reason,
-        )
-        for reason in _PLAYER_ROW_REJECTION_REASONS
-    )
-    unresolved_on_accepted_games = len(accepted_unresolved_keys)
-    overlapping_unresolved_diagnostics = (
-        raw_player_row_rejections - sum(player_row_rejections.values())
-    )
-    accounted_player_rows = (
-        transformed_player_rows
-        + player_parent_blocked
-        + sum(player_row_rejections.values())
-        + unresolved_on_accepted_games
-    )
-    incomplete_group_diagnostics = _issue_count(
-        rejected,
-        entity="game_player",
-        reason="GAME_TEAM_ROLES_INCOMPLETE",
-    )
+    accounted_player_rows = transformed_player_rows + player_parent_blocked
 
     games = {
         "source": source_games,
         "transformed": transformed_games,
-        "metadata_invalid": metadata_invalid,
-        "dependency_invalid": dependency_invalid,
-        "accounted": accounted_games,
-        "difference": source_games - accounted_games,
+        "primary_rejected": len(rejected_list),
+        "primary_reason_counts": _value_counts(primary, "primary_reason"),
+        "duplicate_transformed_rows": duplicate_accepted,
+        "duplicate_primary_rows": duplicate_rejected,
+        "accepted_rejected_overlap": overlap,
+        "accounted": len(accounted_ids),
+        "difference": source_games - len(accounted_ids),
     }
     game_teams = {
         "source": source_team_rows,
@@ -226,22 +240,17 @@ def build_grain_reconciliation(
         "parent_game_blocked": team_parent_blocked,
         "accounted": accounted_team_rows,
         "difference": source_team_rows - accounted_team_rows,
+        **team_integrity,
     }
     game_players = {
         "source": source_player_rows,
         "transformed": transformed_player_rows,
         "parent_game_blocked": player_parent_blocked,
-        "row_rejections": player_row_rejections,
-        "unresolved_identity_on_transformed_game": (
-            unresolved_on_accepted_games
-        ),
-        "incomplete_role_group_diagnostics": incomplete_group_diagnostics,
-        "overlapping_unresolved_row_diagnostics": (
-            overlapping_unresolved_diagnostics
-        ),
         "accounted": accounted_player_rows,
         "difference": source_player_rows - accounted_player_rows,
+        **player_integrity,
     }
+    classified_rows = source_team_rows + source_player_rows
     source = {
         "source": source_rows,
         "player_rows": source_player_rows,
@@ -249,15 +258,25 @@ def build_grain_reconciliation(
         "accounted": classified_rows,
         "difference": source_rows - classified_rows,
     }
-    valid = all(
-        int(section["difference"]) == 0
-        for section in (source, games, game_teams, game_players)
+    target_cardinality_valid = bool(
+        team_integrity["valid"] and player_integrity["valid"]
+    )
+    valid = (
+        all(
+            int(section["difference"]) == 0
+            for section in (source, games, game_teams, game_players)
+        )
+        and duplicate_accepted == 0
+        and duplicate_rejected == 0
+        and overlap == 0
+        and target_cardinality_valid
     )
     return {
         "source_rows": source,
         "games": games,
         "game_teams": game_teams,
         "game_players": game_players,
+        "target_cardinality_valid": target_cardinality_valid,
         "valid": valid,
     }
 
@@ -329,6 +348,11 @@ def build_etl_report_summary(
                 "status",
             ),
             "rejected_entity_counts": rejected_entity_counts,
+            "primary_rejected_games": int(len(result.rejected_games)),
+            "primary_rejection_reason_counts": _value_counts(
+                result.rejected_games,
+                "primary_reason",
+            ),
             "unmapped_champion_reason_counts": _value_counts(
                 result.unmapped_champions,
                 "reason",
@@ -438,14 +462,18 @@ def build_etl_markdown_report(summary: Mapping[str, object]) -> str:
                 ("Game-team", game_teams),
                 ("Game-player", game_players),
                 (
+                    "Target cardinality valid",
+                    reconciliation.get("target_cardinality_valid"),
+                ),
+                (
                     "Grain reconciliation valid",
                     summary.get("grain_reconciliation_valid"),
                 ),
             ]
         ),
         "",
-        "`incomplete_role_group_diagnostics` là diagnostic cấp game-side "
-        "và không được cộng như một source player row độc lập.",
+        "Mỗi source game phải có đúng một disposition: accepted hoặc primary "
+        "rejected. Game accepted phải emit đúng 2 game-team và 10 game-player.",
         "",
         "## 5. Unresolved và rejected",
         "",
@@ -485,12 +513,21 @@ def build_etl_markdown_report(summary: Mapping[str, object]) -> str:
                     "Game metadata detail",
                     summary.get("game_metadata_detail_counts"),
                 ),
+                (
+                    "Primary rejected games",
+                    summary.get("primary_rejected_games"),
+                ),
+                (
+                    "Primary rejection reasons",
+                    summary.get("primary_rejection_reason_counts"),
+                ),
             ]
         ),
         "",
         "Rejected là diagnostic ở nhiều grain và có thể gồm cascade hoặc "
         "group diagnostic; không được diễn giải như số raw rows "
-        "độc lập.",
+        "độc lập. Primary rejected-game chỉ là aggregate bổ sung, không thay "
+        "thế record-level evidence.",
         "",
         "## 6. Champion và giới hạn",
         "",
@@ -505,8 +542,8 @@ def build_etl_markdown_report(summary: Mapping[str, object]) -> str:
         ),
         "",
         "Nguồn không có explicit game-end timestamp nên "
-        "`cutoff_status=UNAVAILABLE`. `date` không được diễn giải là thời "
-        "điểm kết thúc và báo cáo này không cho phép chuyển sang "
+        "`cutoff_status=UNAVAILABLE`. `date` không được diễn giải là scheduled, "
+        "started, ended hoặc cutoff; báo cáo này không cho phép chuyển sang "
         "feature hoặc "
         "huấn luyện mô hình theo thời gian.",
         "",
@@ -518,6 +555,7 @@ def _sorted_frame(
     dataframe: pd.DataFrame,
     *,
     columns: tuple[str, ...],
+    sort_by: tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     missing = sorted(set(columns) - set(dataframe.columns))
     if missing:
@@ -526,8 +564,15 @@ def _sorted_frame(
         )
     result = dataframe.loc[:, list(columns)].copy(deep=True)
     if not result.empty:
+        sort_columns = columns if sort_by is None else sort_by
+        unknown_sort_columns = sorted(set(sort_columns) - set(columns))
+        if unknown_sort_columns:
+            raise ValueError(
+                "Report sort columns are not in its schema: "
+                + ", ".join(unknown_sort_columns)
+            )
         result = result.sort_values(
-            by=list(columns),
+            by=list(sort_columns),
             kind="stable",
             na_position="last",
         ).reset_index(drop=True)
@@ -576,9 +621,17 @@ def write_etl_report_outputs(
     report_dir: str | Path,
     source_path: str | Path,
 ) -> dict[str, str]:
-    """Write the five approved artifacts after safety validation."""
+    """Write the six approved artifacts after safety validation."""
 
     _validate_report_summary(summary)
+    current_reconciliation = build_grain_reconciliation(result)
+    if (
+        current_reconciliation.get("valid") is not True
+        or summary.get("grain_reconciliation") != current_reconciliation
+    ):
+        raise ValueError(
+            "Unsafe ETL report state: result reconciliation is invalid or stale"
+        )
     resolved_dir = Path(report_dir).resolve()
     resolved_source = Path(source_path).resolve()
     summary_source = summary.get("source_path")
@@ -595,6 +648,7 @@ def write_etl_report_outputs(
             resolved_dir / UNMAPPED_CHAMPIONS_FILENAME
         ),
         "rejected_records_path": resolved_dir / REJECTED_RECORDS_FILENAME,
+        "rejected_games_path": resolved_dir / REJECTED_GAMES_FILENAME,
         "etl_report_path": resolved_dir / ETL_REPORT_FILENAME,
     }
     resolved_paths = [path.resolve() for path in paths.values()]
@@ -617,6 +671,11 @@ def write_etl_report_outputs(
         result.rejected_records,
         columns=ISSUE_COLUMNS,
     )
+    rejected_games = _sorted_frame(
+        result.rejected_games,
+        columns=REJECTED_GAME_COLUMNS,
+        sort_by=("gameid",),
+    )
 
     resolved_dir.mkdir(parents=True, exist_ok=True)
     paths["etl_summary_path"].write_text(
@@ -637,6 +696,12 @@ def write_etl_report_outputs(
     )
     rejected_records.to_csv(
         paths["rejected_records_path"],
+        index=False,
+        encoding="utf-8",
+        lineterminator="\n",
+    )
+    rejected_games.to_csv(
+        paths["rejected_games_path"],
         index=False,
         encoding="utf-8",
         lineterminator="\n",

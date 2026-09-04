@@ -12,9 +12,11 @@ import pytest
 from match_insight.data_processing.oracle_etl_report import (
     ETL_REPORT_FILENAME,
     ETL_SUMMARY_FILENAME,
+    REJECTED_GAMES_FILENAME,
     REJECTED_RECORDS_FILENAME,
     UNMAPPED_CHAMPIONS_FILENAME,
     UNRESOLVED_IDENTITIES_FILENAME,
+    _sorted_frame,
     build_etl_report_summary,
     build_grain_reconciliation,
     derive_dry_run_state,
@@ -28,6 +30,7 @@ from match_insight.data_processing.oracle_transform import (
     GAME_TEAM_COLUMNS,
     ISSUE_COLUMNS,
     PLAYER_COLUMNS,
+    REJECTED_GAME_COLUMNS,
     SERIES_BLOCKED,
     SERIES_COLUMNS,
     TARGET_TABLE_ORDER,
@@ -71,7 +74,7 @@ def _make_result() -> OracleDryRunResult:
                 "stage_id": "STAGE-1",
                 "patch_id": "15.1",
                 "game_number": 1,
-                "scheduled_at": pd.Timestamp("2025-01-01T12:00:00Z"),
+                "scheduled_at": None,
                 "started_at": None,
                 "ended_at": None,
                 "winner_team_id": "TEAM-BLUE",
@@ -96,17 +99,19 @@ def _make_result() -> OracleDryRunResult:
         ],
         GAME_TEAM_COLUMNS,
     )
+    roles = ("TOP", "JUNGLE", "MID", "BOT", "SUPPORT")
     game_players = _frame(
         [
             {
                 "game_id": "G1",
-                "side": "BLUE" if index < 3 else "RED",
-                "player_id": f"PLAYER-{index}",
-                "role": ("TOP", "JUNGLE", "MID")[index % 3],
-                "champion_id": f"CHAMPION-{index}",
+                "side": side,
+                "player_id": f"PLAYER-{side}-{role}",
+                "role": role,
+                "champion_id": f"CHAMPION-{side}-{role}",
                 "confirmation_status": "SOURCE_REPORTED",
             }
-            for index in range(6)
+            for side in ("BLUE", "RED")
+            for role in roles
         ],
         GAME_PLAYER_COLUMNS,
     )
@@ -147,15 +152,26 @@ def _make_result() -> OracleDryRunResult:
     unresolved = _frame(
         [
             _issue("series", "G1", "EXPLICIT_BEST_OF_MISSING"),
-            _issue("series", "G2", "GAME_METADATA_INVALID"),
+            _issue("series", "G2", "SOURCE_SERIES_KEY_MISSING"),
             _issue("team_participation", "G2|Blue", "TEAM_UNRESOLVED"),
-            _issue("player_row", "G1|Blue|top|10", "NO_SOURCE_ID_CANDIDATE"),
-            _issue("player_row", "G1|Red|mid|11", "NO_SOURCE_ID_CANDIDATE"),
+            _issue("player_row", "G2|Blue|top|10", "NO_SOURCE_ID_CANDIDATE"),
+            _issue("player_row", "G2|Red|mid|11", "NO_SOURCE_ID_CANDIDATE"),
         ],
         ISSUE_COLUMNS,
     )
     rejected_rows = [
-        _issue("game", "G2", "GAME_METADATA_INVALID", "MISSING_SPLIT"),
+        _issue(
+            "game",
+            "G2",
+            "GAME_LINEUP_INCOMPLETE",
+            "NO_SOURCE_ID_CANDIDATE,TEAM_ROLE_SET_INCOMPLETE",
+        ),
+        _issue(
+            "game_player",
+            "G2|Blue|top|10",
+            "NO_SOURCE_ID_CANDIDATE",
+            "Lineup preflight failed for this source row.",
+        ),
         _issue("game_team", "G2|Blue|20", "GAME_TEAM_BLOCKED_BY_GAME"),
         _issue("game_team", "G2|Red|21", "GAME_TEAM_BLOCKED_BY_GAME"),
     ]
@@ -167,26 +183,33 @@ def _make_result() -> OracleDryRunResult:
         )
         for index in range(10)
     )
-    rejected_rows.extend(
-        [
-            _issue(
-                "game_player",
-                "G1|Blue|JUNGLE",
-                "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET",
-            ),
-            _issue(
-                "game_player",
-                "G1|Red|SUPPORT",
-                "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET",
-            ),
-            _issue(
-                "game_player",
-                "G1|Blue",
-                "GAME_TEAM_ROLES_INCOMPLETE",
-            ),
-        ]
-    )
     rejected = _frame(rejected_rows, ISSUE_COLUMNS)
+    rejected_games = _frame(
+        [
+            {
+                "gameid": "G2",
+                "primary_reason": "GAME_LINEUP_INCOMPLETE",
+                "secondary_reasons": json.dumps(
+                    [
+                        "NO_SOURCE_ID_CANDIDATE",
+                        "TEAM_ROLE_SET_INCOMPLETE",
+                    ]
+                ),
+                "league": "Test League",
+                "source_year": 2025,
+                "calendar_date": "2025-01-02",
+                "patch": "15.1",
+                "split": "Spring",
+                "datacompleteness": "partial",
+                "blue_team": "Blue Team",
+                "red_team": "Red Team",
+                "detail": (
+                    "NO_SOURCE_ID_CANDIDATE,TEAM_ROLE_SET_INCOMPLETE"
+                ),
+            }
+        ],
+        REJECTED_GAME_COLUMNS,
+    )
     analysis = OracleSeriesAnalysis(
         status=SERIES_BLOCKED,
         series_records=pd.DataFrame(),
@@ -201,8 +224,8 @@ def _make_result() -> OracleDryRunResult:
                 {
                     "source_key": "G2",
                     "status": SERIES_BLOCKED,
-                    "reason": "GAME_METADATA_INVALID",
-                    "detail": "MISSING_SPLIT",
+                    "reason": "SOURCE_SERIES_KEY_MISSING",
+                    "detail": "",
                 },
             ]
         ),
@@ -231,6 +254,7 @@ def _make_result() -> OracleDryRunResult:
             "team_rows": 4,
             "distinct_games": 2,
         },
+        rejected_games=rejected_games,
     )
 
 
@@ -255,6 +279,20 @@ def _make_transform_summary(result: OracleDryRunResult) -> dict[str, object]:
         }
         for table in TARGET_TABLE_ORDER
     }
+    unresolved_reason_counts = {
+        str(key): int(value)
+        for key, value in result.unresolved_records["reason"]
+        .value_counts()
+        .sort_index()
+        .items()
+    }
+    rejected_reason_counts = {
+        str(key): int(value)
+        for key, value in result.rejected_records["reason"]
+        .value_counts()
+        .sort_index()
+        .items()
+    }
     return {
         "mode": "DRY_RUN",
         **result.source_counts,
@@ -262,27 +300,20 @@ def _make_transform_summary(result: OracleDryRunResult) -> dict[str, object]:
         "actions": actions,
         "skipped": 0,
         "unresolved": len(result.unresolved_records),
-        "unresolved_reason_counts": {
-            "EXPLICIT_BEST_OF_MISSING": 1,
-            "GAME_METADATA_INVALID": 1,
-            "NO_SOURCE_ID_CANDIDATE": 2,
-            "TEAM_UNRESOLVED": 1,
-        },
+        "unresolved_reason_counts": unresolved_reason_counts,
         "rejected": len(result.rejected_records),
-        "rejected_reason_counts": {
-            "GAME_METADATA_INVALID": 1,
-            "GAME_PLAYER_BLOCKED_BY_GAME": 10,
-            "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET": 2,
-            "GAME_TEAM_BLOCKED_BY_GAME": 2,
-            "GAME_TEAM_ROLES_INCOMPLETE": 1,
+        "rejected_reason_counts": rejected_reason_counts,
+        "primary_rejected_games": len(result.rejected_games),
+        "primary_rejection_reason_counts": {
+            "GAME_LINEUP_INCOMPLETE": 1
         },
-        "game_metadata_detail_counts": {"MISSING_SPLIT": 1},
+        "game_metadata_detail_counts": {},
         "unmapped_champions": 0,
         "series_status": SERIES_BLOCKED,
         "series_game_status_counts": {SERIES_BLOCKED: 1},
         "series_diagnostic_reason_counts": {
             "EXPLICIT_BEST_OF_MISSING": 1,
-            "GAME_METADATA_INVALID": 1,
+            "SOURCE_SERIES_KEY_MISSING": 1,
         },
         "game_transform_status": "PARTIAL",
         "cutoff_status": "UNAVAILABLE",
@@ -349,25 +380,17 @@ def test_summary_has_trace_status_and_exact_grain_reconciliation() -> None:
     assert reconciliation["games"] == {
         "source": 2,
         "transformed": 1,
-        "metadata_invalid": 1,
-        "dependency_invalid": 0,
+        "primary_rejected": 1,
+        "primary_reason_counts": {"GAME_LINEUP_INCOMPLETE": 1},
+        "duplicate_transformed_rows": 0,
+        "duplicate_primary_rows": 0,
+        "accepted_rejected_overlap": 0,
         "accounted": 2,
         "difference": 0,
     }
     assert reconciliation["game_teams"]["difference"] == 0
     assert reconciliation["game_players"]["difference"] == 0
-    assert reconciliation["game_players"][
-        "unresolved_identity_on_transformed_game"
-    ] == 2
-    assert reconciliation["game_players"]["row_rejections"][
-        "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET"
-    ] == 2
-    assert reconciliation["game_players"][
-        "incomplete_role_group_diagnostics"
-    ] == 1
-    assert reconciliation["game_players"][
-        "overlapping_unresolved_row_diagnostics"
-    ] == 0
+    assert reconciliation["target_cardinality_valid"] is True
     assert summary["grain_reconciliation_valid"] is True
     assert transform_summary == summary_before
     pd.testing.assert_frame_equal(result.unresolved_records, unresolved_before)
@@ -397,6 +420,7 @@ def test_writer_creates_exact_outputs_and_identity_only_csv(
         UNRESOLVED_IDENTITIES_FILENAME,
         UNMAPPED_CHAMPIONS_FILENAME,
         REJECTED_RECORDS_FILENAME,
+        REJECTED_GAMES_FILENAME,
         ETL_REPORT_FILENAME,
     }
     assert {Path(path).name for path in outputs.values()} == expected_names
@@ -417,10 +441,25 @@ def test_writer_creates_exact_outputs_and_identity_only_csv(
     rejected = pd.read_csv(report_dir / REJECTED_RECORDS_FILENAME)
     assert len(rejected) == len(result.rejected_records)
     assert tuple(rejected.columns) == ISSUE_COLUMNS
+    traced = rejected.loc[
+        rejected["reason"].eq("NO_SOURCE_ID_CANDIDATE")
+    ].iloc[0]
+    assert traced["entity"] == "game_player"
+    assert traced["source_key"] == "G2|Blue|top|10"
+    assert traced["detail"] == (
+        "Lineup preflight failed for this source row."
+    )
+    rejected_games = pd.read_csv(report_dir / REJECTED_GAMES_FILENAME)
+    assert len(rejected_games) == len(result.rejected_games)
+    assert tuple(rejected_games.columns) == REJECTED_GAME_COLUMNS
+    assert rejected_games["gameid"].is_unique
+    assert rejected_games.iloc[0]["primary_reason"] == (
+        "GAME_LINEUP_INCOMPLETE"
+    )
     markdown = (report_dir / ETL_REPORT_FILENAME).read_text(encoding="utf-8")
     assert "Dry-run status | PARTIAL" in markdown
     assert "Cutoff status | UNAVAILABLE" in markdown
-    assert "diagnostic ở nhiều grain" in markdown
+    assert "record-level evidence" in markdown
     assert summary == summary_before
     pd.testing.assert_frame_equal(result.unresolved_records, unresolved_before)
     pd.testing.assert_frame_equal(result.rejected_records, rejected_before)
@@ -470,96 +509,144 @@ def test_writer_refuses_to_overwrite_raw_source(tmp_path: Path) -> None:
         )
 
 
-def test_player_reconciliation_partitions_63_rejected_and_37_unresolved() -> None:
+def test_reconciliation_rejects_duplicate_primary_rows() -> None:
     base = _make_result()
-    game_rows: list[dict[str, object]] = []
-    team_rows: list[dict[str, object]] = []
-    for game_index in range(10):
-        game_id = f"G{game_index}"
-        game_rows.append(
-            {
-                "game_id": game_id,
-                "series_id": None,
-                "stage_id": "STAGE-1",
-                "patch_id": "15.1",
-                "game_number": 1,
-                "scheduled_at": pd.Timestamp("2025-01-01T12:00:00Z"),
-                "started_at": None,
-                "ended_at": None,
-                "winner_team_id": f"TEAM-{game_index}-BLUE",
-            }
-        )
-        for side in ("BLUE", "RED"):
-            team_rows.append(
-                {
-                    "game_id": game_id,
-                    "team_id": f"TEAM-{game_index}-{side}",
-                    "side": side,
-                    "confirmation_status": "SOURCE_REPORTED",
-                }
-            )
-
-    unresolved = _frame(
-        [
-            _issue(
-                "player_row",
-                f"G{index % 10}|Blue|top|{index}",
-                "NO_SOURCE_ID_CANDIDATE",
-            )
-            for index in range(37)
-        ],
-        ISSUE_COLUMNS,
+    duplicate_primary = pd.concat(
+        [base.rejected_games, base.rejected_games],
+        ignore_index=True,
     )
-    rejected_rows = [
-        _issue(
-            "game_player",
-            f"G{index % 10}|side|ROLE-{index}",
-            "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET",
-        )
-        for index in range(63)
-    ]
-    rejected_rows.extend(
-        _issue(
-            "game_player",
-            f"G{index // 2}|SIDE-{index % 2}",
-            "GAME_TEAM_ROLES_INCOMPLETE",
-        )
-        for index in range(20)
-    )
-    records = replace(
-        base.records,
-        games=_frame(game_rows, GAME_COLUMNS),
-        game_teams=_frame(team_rows, GAME_TEAM_COLUMNS),
-        game_players=_frame([], GAME_PLAYER_COLUMNS),
-    )
-    result = replace(
-        base,
-        records=records,
-        unresolved_records=unresolved,
-        rejected_records=_frame(rejected_rows, ISSUE_COLUMNS),
-        source_counts={
-            "source_rows": 120,
-            "player_rows": 100,
-            "team_rows": 20,
-            "distinct_games": 10,
-        },
-    )
+    result = replace(base, rejected_games=duplicate_primary)
 
     reconciliation = build_grain_reconciliation(result)
 
-    assert reconciliation["game_players"]["transformed"] == 0
-    assert reconciliation["game_players"]["row_rejections"][
-        "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET"
-    ] == 63
-    assert reconciliation["game_players"][
-        "unresolved_identity_on_transformed_game"
-    ] == 37
-    assert reconciliation["game_players"][
-        "incomplete_role_group_diagnostics"
-    ] == 20
-    assert reconciliation["game_players"]["accounted"] == 100
-    assert reconciliation["game_players"]["difference"] == 0
-    assert reconciliation["valid"] is True
+    assert reconciliation["games"]["duplicate_primary_rows"] == 1
+    assert reconciliation["valid"] is False
+
+
+def test_reconciliation_rejects_accepted_rejected_overlap() -> None:
+    base = _make_result()
+    overlapping = base.rejected_games.copy(deep=True)
+    overlapping.loc[:, "gameid"] = "G1"
+    result = replace(base, rejected_games=overlapping)
+
+    reconciliation = build_grain_reconciliation(result)
+
+    assert reconciliation["games"]["accepted_rejected_overlap"] == 1
+    assert reconciliation["valid"] is False
+
+
+def test_reconciliation_rejects_duplicate_transformed_game_rows() -> None:
+    base = _make_result()
+    duplicate_games = pd.concat(
+        [base.records.games, base.records.games],
+        ignore_index=True,
+    )
+    records = replace(base.records, games=duplicate_games)
+
+    reconciliation = build_grain_reconciliation(
+        replace(base, records=records)
+    )
+
+    assert reconciliation["games"]["duplicate_transformed_rows"] == 1
+    assert reconciliation["valid"] is False
+
+
+@pytest.mark.parametrize("child", ("game_teams", "game_players"))
+def test_reconciliation_rejects_incomplete_target_cardinality(
+    child: str,
+) -> None:
+    base = _make_result()
+    frame = getattr(base.records, child).iloc[:-1].copy()
+    records = replace(base.records, **{child: frame})
+
+    reconciliation = build_grain_reconciliation(
+        replace(base, records=records)
+    )
+
+    assert reconciliation["target_cardinality_valid"] is False
+    assert reconciliation["valid"] is False
+
+
+@pytest.mark.parametrize("child", ("game_teams", "game_players"))
+def test_reconciliation_rejects_orphan_child_with_unchanged_total(
+    child: str,
+) -> None:
+    base = _make_result()
+    frame = getattr(base.records, child).copy(deep=True)
+    frame.loc[frame.index[-1], "game_id"] = "GHOST"
+    records = replace(base.records, **{child: frame})
+
+    reconciliation = build_grain_reconciliation(
+        replace(base, records=records)
+    )
+
+    assert reconciliation[child]["orphan_rows"] == 1
+    assert reconciliation[child]["invalid_game_count"] == 1
+    assert reconciliation["target_cardinality_valid"] is False
+    assert reconciliation["valid"] is False
+
+
+def test_writer_rejects_stale_result_reconciliation(tmp_path: Path) -> None:
+    source_path = tmp_path / "oracle-fixture.csv"
+    result, summary = _build_summary(source_path)
+    duplicate_primary = pd.concat(
+        [result.rejected_games, result.rejected_games],
+        ignore_index=True,
+    )
+    stale_result = replace(result, rejected_games=duplicate_primary)
+    report_dir = tmp_path / "reports"
+
+    with pytest.raises(ValueError, match="result reconciliation"):
+        write_etl_report_outputs(
+            summary=summary,
+            result=stale_result,
+            report_dir=report_dir,
+            source_path=source_path,
+        )
+
+    assert not report_dir.exists()
+
+
+def test_rejected_game_sort_accepts_mixed_source_year_trace_types() -> None:
+    rows = [
+        {
+            "gameid": "G2",
+            "primary_reason": "GAME_METADATA_INVALID",
+            "secondary_reasons": "[]",
+            "league": "League",
+            "source_year": 2025,
+            "calendar_date": "2025-01-01",
+            "patch": "15.1",
+            "split": "Spring",
+            "datacompleteness": "complete",
+            "blue_team": "Blue",
+            "red_team": "Red",
+            "detail": "CONFLICTING_YEAR",
+        },
+        {
+            "gameid": "G1",
+            "primary_reason": "GAME_METADATA_INVALID",
+            "secondary_reasons": "[]",
+            "league": "League",
+            "source_year": "[2024, 2025]",
+            "calendar_date": "2025-01-02",
+            "patch": "15.1",
+            "split": "Spring",
+            "datacompleteness": "complete",
+            "blue_team": "Blue",
+            "red_team": "Red",
+            "detail": "CONFLICTING_YEAR",
+        },
+    ]
+
+    sorted_frame = _sorted_frame(
+        _frame(rows, REJECTED_GAME_COLUMNS),
+        columns=REJECTED_GAME_COLUMNS,
+        sort_by=("gameid",),
+    )
+
+    assert sorted_frame["gameid"].tolist() == ["G1", "G2"]
+    assert sorted_frame["source_year"].tolist() == ["[2024, 2025]", 2025]
 
 
 @pytest.mark.parametrize(

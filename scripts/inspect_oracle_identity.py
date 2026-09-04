@@ -333,7 +333,7 @@ def print_inspection_result(
         f"{team_counts.get(SOURCE_ID, 0)}"
     )
     print(
-        "team_recovered_unique="
+        "team_recovered_unique_context="
         f"{team_counts.get(RECOVERED_UNIQUE, 0)}"
     )
     print(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -30,12 +31,12 @@ from match_insight.data_processing.oracle_transform import (
     GAME_TRANSFORM_PARTIAL,
     GAME_TRANSFORM_READY,
     PLAYER_COLUMNS,
+    REJECTED_GAME_COLUMNS,
     ROLE_MAP,
     SERIES_BLOCKED,
     SERIES_COLUMNS,
     SERIES_READY,
     SIDE_MAP,
-    SOURCE_CHAMPION_UNMAPPED,
     SOURCE_REPORTED,
     TARGET_TABLE_ORDER,
     TEAM_COLUMNS,
@@ -43,6 +44,7 @@ from match_insight.data_processing.oracle_transform import (
     TOURNAMENT_STAGE_COLUMNS,
     OracleDryRunResult,
     OracleTargetSnapshot,
+    _record_actions,
     analyze_series_evidence,
     build_dry_run_summary,
     transform_oracle_targets,
@@ -346,6 +348,68 @@ def test_patch_source_year_and_context_ids_are_preserved_and_deterministic() -> 
         first.records.tournament_stages.iloc[0]["stage_id"]
         == second.records.tournament_stages.iloc[0]["stage_id"]
     )
+
+
+def test_missing_split_rejects_the_whole_game_without_unspecified_stage() -> None:
+    core_data = make_core_data(make_game_rows(split=None))
+    identities = make_identity_result(core_data)
+
+    result = transform_oracle_targets(core_data, identities)
+
+    assert result.records.games.empty
+    assert result.records.game_teams.empty
+    assert result.records.game_players.empty
+    assert not result.records.tournament_stages["name"].eq(
+        "UNSPECIFIED"
+    ).any()
+    rejection = result.rejected_games.iloc[0]
+    assert rejection["primary_reason"] == "GAME_METADATA_INVALID"
+    assert "MISSING_SPLIT" in json.loads(rejection["secondary_reasons"])
+    assert set(result.records.games["game_id"]).isdisjoint(
+        set(result.rejected_games["gameid"])
+    )
+
+
+def test_mixed_missing_split_rejects_the_whole_game() -> None:
+    rows = make_game_rows(split="Spring")
+    rows[0]["split"] = None
+    core_data = make_core_data(rows)
+
+    result = transform_oracle_targets(
+        core_data,
+        make_identity_result(core_data),
+    )
+
+    assert result.records.games.empty
+    assert result.records.game_teams.empty
+    assert result.records.game_players.empty
+    assert not result.records.tournament_stages["name"].eq(
+        "UNSPECIFIED"
+    ).any()
+    rejection = result.rejected_games.iloc[0]
+    assert rejection["primary_reason"] == "GAME_METADATA_INVALID"
+    assert "MIXED_MISSING_SPLIT" in json.loads(
+        rejection["secondary_reasons"]
+    )
+
+
+def test_missing_gameid_fails_closed_before_game_grain_transform() -> None:
+    rows = make_game_rows()
+    rows[0]["gameid"] = None
+    core_data = make_core_data(rows)
+    identities = OracleIdentityResult(
+        team_participations=pd.DataFrame(),
+        player_rows=pd.DataFrame(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "cannot establish game grain.*gameid is missing.*"
+            "No source or target ID was fabricated"
+        ),
+    ):
+        transform_oracle_targets(core_data, identities)
 
 
 def test_conflicting_metadata_in_one_game_is_rejected() -> None:
@@ -714,16 +778,18 @@ def test_game_records_preserve_time_winner_sides_roles_and_player_champions() ->
     assert game["game_id"] == "SERIES-bo3_game_1"
     assert game["series_id"] == "SERIES-bo3"
     assert pd.isna(game["stage_id"])
-    assert game["scheduled_at"] == pd.Timestamp("2025-01-01T12:00:00Z")
+    assert game["scheduled_at"] is None
     assert game["started_at"] is None
     assert game["ended_at"] is None
     assert game["winner_team_id"] == "TEAM-BLUE"
     assert set(result.records.game_teams["side"]) == {"BLUE", "RED"}
+    assert len(result.records.game_teams) == 2
     assert set(result.records.game_teams["confirmation_status"]) == {
         SOURCE_REPORTED
     }
     assert set(result.records.game_players["role"]) == set(ROLE_MAP.values())
     assert len(result.records.game_players) == 10
+    assert result.records.game_players["player_id"].nunique() == 10
     assert set(result.records.game_players["confirmation_status"]) == {
         SOURCE_REPORTED
     }
@@ -763,7 +829,7 @@ def test_unresolved_team_is_reported_and_rejects_the_game() -> None:
     ].empty
 
 
-def test_unresolved_player_is_reported_without_hiding_the_row_rejection() -> None:
+def test_unresolved_player_rejects_the_whole_game_before_target_records() -> None:
     rows = make_game_rows()
     for row in rows:
         if row["side"] == "Blue" and row["position"] == "top":
@@ -773,20 +839,29 @@ def test_unresolved_player_is_reported_without_hiding_the_row_rejection() -> Non
 
     result = transform_oracle_targets(core_data, identities)
 
-    assert len(result.records.games) == 1
-    assert len(result.records.game_players) == 5
+    assert result.records.games.empty
+    assert result.records.game_teams.empty
+    assert result.records.game_players.empty
     assert not result.unresolved_records.loc[
         result.unresolved_records["entity"].eq("player_row")
     ].empty
-    assert "GAME_TEAM_ROLES_INCOMPLETE" in set(
-        result.rejected_records["reason"]
+    assert tuple(result.rejected_games.columns) == REJECTED_GAME_COLUMNS
+    assert result.rejected_games.iloc[0]["primary_reason"] == (
+        "GAME_LINEUP_INCOMPLETE"
     )
-    assert "GAME_PLAYER_BLOCKED_BY_INCOMPLETE_ROLE_SET" in set(
-        result.rejected_records["reason"]
+    secondary = set(
+        json.loads(result.rejected_games.iloc[0]["secondary_reasons"])
     )
+    assert {
+        "GAME_REQUIRES_TEN_RESOLVED_PLAYERS",
+        "MISSING_PLAYER_ID",
+        "NO_SOURCE_ID_CANDIDATE",
+        "TEAM_ROLE_SET_INCOMPLETE",
+    } <= secondary
+    assert len(result.records.games) + len(result.rejected_games) == 1
 
 
-def test_unmapped_champion_is_explicit_and_keeps_player_participation() -> None:
+def test_unmapped_champion_is_explicit_and_rejects_the_whole_game() -> None:
     missing_name = "Champion-Blue-top"
     core_data = make_core_data(make_game_rows())
     identities = make_identity_result(
@@ -805,12 +880,130 @@ def test_unmapped_champion_is_explicit_and_keeps_player_participation() -> None:
             "reason": "NO_CHAMPION_MATCH",
         }
     ]
-    player = result.records.game_players.loc[
-        result.records.game_players["side"].eq("BLUE")
-        & result.records.game_players["role"].eq("TOP")
-    ].iloc[0]
-    assert pd.isna(player["champion_id"])
-    assert player["confirmation_status"] == SOURCE_CHAMPION_UNMAPPED
+    assert result.records.games.empty
+    assert result.records.game_teams.empty
+    assert result.records.game_players.empty
+    assert result.rejected_games.iloc[0]["primary_reason"] == (
+        "GAME_LINEUP_INCOMPLETE"
+    )
+    assert "CHAMPION_UNMAPPED" in json.loads(
+        result.rejected_games.iloc[0]["secondary_reasons"]
+    )
+
+
+def test_source_game_with_only_one_side_players_is_rejected_whole() -> None:
+    rows = [
+        row
+        for row in make_game_rows(gameid="ONE-SIDE-PLAYERS")
+        if row["side"] == "Blue" or row["position"] == "team"
+    ]
+    core_data = make_core_data(rows)
+
+    result = transform_oracle_targets(
+        core_data,
+        make_identity_result(core_data),
+    )
+
+    assert result.records.games.empty
+    assert result.records.game_teams.empty
+    assert result.records.game_players.empty
+    assert len(result.rejected_games) == 1
+    secondary = set(
+        json.loads(result.rejected_games.iloc[0]["secondary_reasons"])
+    )
+    assert "GAME_REQUIRES_TEN_RESOLVED_PLAYERS" in secondary
+    assert "TEAM_ROLE_SET_INCOMPLETE" in secondary
+
+
+def test_duplicate_game_participant_id_rejects_the_whole_game() -> None:
+    rows = make_game_rows()
+    for row in rows:
+        if row["side"] == "Red" and row["position"] == "sup":
+            row["participantid"] = 1
+    core_data = make_core_data(rows)
+
+    result = transform_oracle_targets(
+        core_data,
+        make_identity_result(core_data),
+    )
+
+    assert result.records.games.empty
+    assert result.records.game_teams.empty
+    assert result.records.game_players.empty
+    assert "DUPLICATE_GAME_PARTICIPANT_ID" in json.loads(
+        result.rejected_games.iloc[0]["secondary_reasons"]
+    )
+
+
+def test_duplicate_player_identity_rejects_the_whole_game() -> None:
+    rows = make_game_rows()
+    for row in rows:
+        if row["side"] == "Red" and row["position"] == "sup":
+            row["playerid"] = "PLAYER-BLUE-top"
+            row["playername"] = "Blue top Player"
+    core_data = make_core_data(rows)
+
+    result = transform_oracle_targets(
+        core_data,
+        make_identity_result(core_data),
+    )
+
+    assert result.records.games.empty
+    assert result.records.game_teams.empty
+    assert result.records.game_players.empty
+    assert "GAME_REQUIRES_TEN_UNIQUE_PLAYERS" in json.loads(
+        result.rejected_games.iloc[0]["secondary_reasons"]
+    )
+
+
+def test_rejected_game_artifact_is_unique_disjoint_and_traceable() -> None:
+    rows = make_series_rows()
+    for row in rows:
+        if (
+            row["gameid"] == "SERIES-bo3_game_2"
+            and row["side"] == "Red"
+            and row["position"] == "sup"
+        ):
+            row["playerid"] = None
+            row["playername"] = "Unknown Red Support"
+    core_data = make_core_data(rows)
+
+    result = transform_oracle_targets(
+        core_data,
+        make_identity_result(core_data),
+    )
+
+    rejected = result.rejected_games
+    assert tuple(rejected.columns) == REJECTED_GAME_COLUMNS
+    assert rejected["gameid"].is_unique
+    assert len(rejected) == 1
+    row = rejected.iloc[0]
+    assert row["gameid"] == "SERIES-bo3_game_2"
+    assert row["primary_reason"] == "GAME_LINEUP_INCOMPLETE"
+    assert row["league"] == "TEST"
+    assert row["source_year"] == 2026
+    assert row["calendar_date"] == "2025-01-02"
+    assert row["patch"] == "15.10"
+    assert row["split"] == "Spring"
+    assert row["datacompleteness"] == "complete"
+    assert row["blue_team"] == "Blue Team"
+    assert row["red_team"] == "Red Team"
+    assert row["detail"]
+
+    accepted_ids = set(result.records.games["game_id"].astype(str))
+    rejected_ids = set(rejected["gameid"].astype(str))
+    assert accepted_ids.isdisjoint(rejected_ids)
+    assert len(accepted_ids) + len(rejected_ids) == (
+        result.source_counts["distinct_games"]
+    )
+    root_diagnostics = result.rejected_records.loc[
+        result.rejected_records["reason"].eq("NO_SOURCE_ID_CANDIDATE")
+    ]
+    assert not root_diagnostics.empty
+    assert root_diagnostics["source_key"].str.contains(
+        "SERIES-bo3_game_2"
+    ).all()
+    assert root_diagnostics["detail"].ne("").all()
 
 
 def test_new_entities_use_exact_oracle_ids_as_target_primary_keys() -> None:
@@ -944,6 +1137,58 @@ def test_existing_entity_names_and_media_are_preserved_and_skipped() -> None:
     assert set(entity_actions["action"]) == {"SKIP"}
 
 
+def test_null_preserve_columns_forecast_skip_for_idempotent_replay() -> None:
+    core_data = make_core_data(make_game_rows())
+    identities = make_identity_result(core_data)
+    first = transform_oracle_targets(core_data, identities)
+    snapshot = snapshot_from_result(first)
+    snapshot.teams["logo_file"] = "teams/existing.png"
+    snapshot.players["photo_file"] = "players/existing.png"
+    snapshot.games["started_at"] = pd.Timestamp("2025-01-01T12:00:00Z")
+    snapshot.games["ended_at"] = pd.Timestamp("2025-01-01T12:30:00Z")
+
+    actions, _ = _record_actions(first.records, snapshot)
+
+    preserved_actions = actions.loc[
+        actions["table"].isin(["team", "player", "game"])
+    ]
+    assert len(preserved_actions) == 13
+    assert set(preserved_actions["action"]) == {"SKIP"}
+
+
+def test_non_null_preserve_column_difference_forecasts_update() -> None:
+    core_data = make_core_data(make_game_rows())
+    identities = make_identity_result(core_data)
+    first = transform_oracle_targets(core_data, identities)
+    snapshot = snapshot_from_result(first)
+    snapshot.teams["logo_file"] = "teams/existing.png"
+    snapshot.players["photo_file"] = "players/existing.png"
+    snapshot.games["started_at"] = pd.Timestamp("2025-01-01T12:00:00Z")
+    snapshot.games["ended_at"] = pd.Timestamp("2025-01-01T12:30:00Z")
+
+    teams = first.records.teams.copy(deep=True)
+    teams["logo_file"] = "teams/new.png"
+    players = first.records.players.copy(deep=True)
+    players["photo_file"] = "players/new.png"
+    games = first.records.games.copy(deep=True)
+    games["started_at"] = pd.Timestamp("2025-01-01T12:01:00Z")
+    games["ended_at"] = pd.Timestamp("2025-01-01T12:31:00Z")
+    candidates = replace(
+        first.records,
+        teams=teams,
+        players=players,
+        games=games,
+    )
+
+    actions, _ = _record_actions(candidates, snapshot)
+
+    changed_actions = actions.loc[
+        actions["table"].isin(["team", "player", "game"])
+    ]
+    assert len(changed_actions) == 13
+    assert set(changed_actions["action"]) == {"UPDATE"}
+
+
 def test_snapshot_oracle_id_recovers_existing_target_and_media_fail_closed() -> None:
     core_data = make_core_data(make_game_rows())
     identities = make_identity_result(core_data)
@@ -1058,6 +1303,8 @@ def test_dynamic_reconciliation_matches_records_actions_and_source_grains() -> N
     assert len(second.skipped_records) == expected_skipped
     assert summary["unresolved"] == len(second.unresolved_records)
     assert summary["rejected"] == len(second.rejected_records)
+    assert summary["primary_rejected_games"] == len(second.rejected_games)
+    assert summary["primary_rejection_reason_counts"] == {}
     assert summary["unmapped_champions"] == len(second.unmapped_champions)
     validate_reconciliation(second, dict(summary))
 
@@ -1083,6 +1330,24 @@ def test_reconciliation_requires_exactly_one_game_parent(
     summary = dict(build_dry_run_summary(invalid_result))
 
     with pytest.raises(ValueError, match="game_parent_xor"):
+        validate_reconciliation(invalid_result, summary)
+
+
+def test_reconciliation_rejects_any_unspecified_stage() -> None:
+    core_data = make_core_data(make_game_rows())
+    result = transform_oracle_targets(
+        core_data,
+        make_identity_result(core_data),
+    )
+    stages = result.records.tournament_stages.copy(deep=True)
+    stages.loc[:, "name"] = "UNSPECIFIED"
+    invalid_result = replace(
+        result,
+        records=replace(result.records, tournament_stages=stages),
+    )
+    summary = dict(build_dry_run_summary(invalid_result))
+
+    with pytest.raises(ValueError, match="unspecified_stage"):
         validate_reconciliation(invalid_result, summary)
 
 
