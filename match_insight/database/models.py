@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Identity,
     Index,
+    Integer,
     SmallInteger,
     String,
     Text,
@@ -330,11 +331,48 @@ class GamePlayer(Base):
     confirmation_status: Mapped[str] = mapped_column(String(20), nullable=False)
 
 
+class AnalysisSession(Base):
+    """Independent user analysis; creation records first persistence, not PRE time."""
+
+    __tablename__ = "analysis_session"
+
+    analysis_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
+class EvaluationHistory(Base):
+    """Immutable, content-addressed history shared by persisted PRE/POST snapshots."""
+
+    __tablename__ = "evaluation_history"
+    __table_args__ = (
+        CheckConstraint("history_sha256 ~ '^[0-9a-f]{64}$'", name="ck_evaluation_history_hash"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'", name="ck_evaluation_history_payload"),
+    )
+
+    history_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+
+
 class Evaluation(Base):
     """Bản đánh giá PRE hoặc POST bất biến của một ván."""
 
     __tablename__ = "evaluation"
     __table_args__ = (
+        CheckConstraint(
+            "(game_id IS NULL AND analysis_id IS NOT NULL "
+            "AND inference_mode = 'INTERACTIVE_ANALYSIS' AND origin = 'INTERACTIVE') OR "
+            "(game_id IS NOT NULL AND analysis_id IS NULL "
+            "AND inference_mode = 'REAL_RETROSPECTIVE_SIMULATION' "
+            "AND origin = 'RETROSPECTIVE_IMPORT')",
+            name="ck_evaluation_subject",
+        ),
+        CheckConstraint("context_key ~ '^[0-9a-f]{64}$'", name="ck_evaluation_context_key"),
+        CheckConstraint("idempotency_key ~ '^[0-9a-f]{64}$'", name="ck_evaluation_idempotency_key"),
+        CheckConstraint("jsonb_typeof(provenance) = 'object'", name="ck_evaluation_provenance"),
+        CheckConstraint("jsonb_typeof(input_snapshot) = 'object'", name="ck_evaluation_snapshot"),
+        UniqueConstraint("idempotency_key", name="uq_evaluation_idempotency_key"),
         CheckConstraint(
             "evaluation_type IN ('PRE', 'POST')",
             name="ck_evaluation_type",
@@ -364,6 +402,13 @@ class Evaluation(Base):
             unique=True,
             postgresql_where=text("is_active IS TRUE"),
         ),
+        Index("ix_evaluation_analysis_type", "analysis_id", "evaluation_type"),
+        Index(
+            "uq_evaluation_one_active_analysis_model",
+            "analysis_id", "evaluation_type", "model_version",
+            unique=True,
+            postgresql_where=text("is_active IS TRUE AND analysis_id IS NOT NULL"),
+        ),
     )
 
     evaluation_id: Mapped[int] = mapped_column(
@@ -371,10 +416,22 @@ class Evaluation(Base):
         Identity(),
         primary_key=True,
     )
-    game_id: Mapped[str] = mapped_column(
+    game_id: Mapped[str | None] = mapped_column(
         String(100),
         ForeignKey("game.game_id"),
-        nullable=False,
+        nullable=True,
+    )
+    analysis_id: Mapped[str | None] = mapped_column(
+        String(100), ForeignKey("analysis_session.analysis_id"), nullable=True,
+    )
+    inference_mode: Mapped[str] = mapped_column(String(40), nullable=False)
+    origin: Mapped[str] = mapped_column(String(32), nullable=False)
+    context_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    inferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provenance: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    history_sha256: Mapped[str] = mapped_column(
+        String(64), ForeignKey("evaluation_history.history_sha256"), nullable=False,
     )
     evaluation_type: Mapped[str] = mapped_column(String(4), nullable=False)
     blue_win_probability: Mapped[float] = mapped_column(Double, nullable=False)
@@ -387,8 +444,8 @@ class Evaluation(Base):
         DateTime(timezone=True),
         nullable=False,
     )
-    data_version: Mapped[str] = mapped_column(String(50), nullable=False)
-    model_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    data_version: Mapped[str] = mapped_column(Text, nullable=False)
+    model_version: Mapped[str] = mapped_column(Text, nullable=False)
     input_snapshot: Mapped[dict[str, object]] = mapped_column(
         JSONB,
         nullable=False,
@@ -414,6 +471,11 @@ class EvaluationWarning(Base):
     """Cảnh báo gắn với một evaluation đã được tạo."""
 
     __tablename__ = "evaluation_warning"
+    __table_args__ = (
+        UniqueConstraint("evaluation_id", "position", name="uq_evaluation_warning_position"),
+        CheckConstraint("position >= 0", name="ck_evaluation_warning_position"),
+        CheckConstraint("jsonb_typeof(details) = 'object'", name="ck_evaluation_warning_details"),
+    )
 
     warning_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -426,5 +488,8 @@ class EvaluationWarning(Base):
         nullable=False,
     )
     warning_group: Mapped[str] = mapped_column(String(20), nullable=False)
+    warning_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    details: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     severity: Mapped[str] = mapped_column(String(10), nullable=False)

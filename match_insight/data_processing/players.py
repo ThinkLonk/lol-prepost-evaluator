@@ -20,6 +20,7 @@ from match_insight.data_processing.leaguepedia import (
     fetch_cargo_rows,
     fetch_file_urls,
 )
+from match_insight.data_processing.media_policy import load_media_exclusions
 from match_insight.data_processing.reference_common import (
     SyncStats,
     asset_stem,
@@ -1808,6 +1809,7 @@ def sync_player_media(
 
     stats = PlayerMediaSyncResult()
     asset_dir = project_root / "assets" / "players"
+    excluded_ids = load_media_exclusions(project_root, "players")
     player_ids = [
         record.player_id for record in records
     ]
@@ -1824,6 +1826,9 @@ def sync_player_media(
     # vậy không giữ một transaction PostgreSQL đang mở.
     for record in records:
         if record.photo_url is None:
+            continue
+        if record.player_id in excluded_ids:
+            stats.media_skipped += 1
             continue
 
         player_id = validate_stable_id(

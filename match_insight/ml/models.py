@@ -9,9 +9,10 @@ import hashlib
 import json
 import math
 import platform
+import re
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, is_dataclass
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass, is_dataclass, replace
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from io import BytesIO
 from numbers import Real
@@ -64,6 +65,12 @@ CONTEXT_COLUMNS = tuple(
     for column in METADATA_COLUMNS
     if column not in {"target_ended_at", "post_feature_game_ids"}
 )
+INTERACTIVE_INFERENCE_POLICY = "interactive-pre-utc-day-minus1-v1"
+INTERACTIVE_CONTEXT_COLUMNS = (
+    "history_cutoff_at", "patch", "blue_team_id", "red_team_id", "blue_roster", "red_roster",
+    "pre_config_version", "post_config_version", "pre_config", "history_game_ids",
+    "pre_feature_game_ids", "history_exclusions", "history_counts", "runtime_context",
+)
 NUMERIC_PRE_COLUMNS = tuple(
     column for column in PRE_COLUMNS if not column.endswith("_missing")
 )
@@ -76,6 +83,29 @@ NUMERIC_POST_COLUMNS = tuple(
 
 class ModelInputError(PreFeatureInputError):
     """Invalid model input, artifact or PRE/POST comparison."""
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeInferenceContext:
+    """Runtime assertions, separate from the fitted artifact's training protocol."""
+
+    analysis_id: str
+    pre_created_at: datetime
+    history_cutoff_at: datetime
+    runtime_ready_at: datetime
+    snapshot_read_at: datetime
+    snapshot_sha256: str
+    evidence_sha256: str
+    history_pool_sha256: str
+    history_pool_game_ids: tuple[str, ...]
+    history_available_at: datetime
+    context_source: str = "USER_PROVIDED"
+    user_confirmed: bool = True
+    pre_draft_verification: str = "NOT_VERIFIED"
+    inference_mode: str = "INTERACTIVE_ANALYSIS"
+    policy_version: str = INTERACTIVE_INFERENCE_POLICY
+    context_label: str | None = None
+    planned_start_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +239,62 @@ def _utc(value):
     ):
         _fail("E_MODEL_TIMESTAMP_INVALID", "Expected an explicit timezone-aware datetime")
     return value.astimezone(UTC)
+
+
+def interactive_cutoff(pre_created_at):
+    """Apply the runtime policy to a supplied system instant; never read a clock."""
+    instant = _utc(pre_created_at)
+    try:
+        return instant.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    except OverflowError:
+        _fail("E_MODEL_TIMESTAMP_INVALID", "Creation instant cannot yield a prior UTC day")
+
+
+def validate_runtime_context(context):
+    """Normalize assertions without certifying user input or source authenticity."""
+    if not isinstance(context, RuntimeInferenceContext):
+        _fail("E_MODEL_METADATA_INVALID", "Expected RuntimeInferenceContext")
+    if (
+        not isinstance(context.analysis_id, str)
+        or re.fullmatch(r"analysis:[A-Za-z0-9][A-Za-z0-9._:-]{0,90}", context.analysis_id) is None
+        or context.context_source != "USER_PROVIDED"
+        or context.user_confirmed is not True
+        or context.pre_draft_verification != "NOT_VERIFIED"
+        or context.inference_mode != "INTERACTIVE_ANALYSIS"
+        or context.policy_version != INTERACTIVE_INFERENCE_POLICY
+        or (context.context_label is not None and not _text(context.context_label))
+    ):
+        _fail("E_MODEL_METADATA_INVALID", "Invalid interactive identity, policy or confirmation")
+    for digest in (context.snapshot_sha256, context.evidence_sha256, context.history_pool_sha256):
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            _fail("E_MODEL_METADATA_INVALID", "History provenance requires SHA-256 identities")
+    ids = context.history_pool_game_ids
+    if (
+        not isinstance(ids, tuple)
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}", value) is None
+            for value in ids
+        )
+        or tuple(sorted(set(ids))) != ids
+        or context.analysis_id in ids
+    ):
+        _fail("E_MODEL_METADATA_INVALID", "History pool IDs must be unique and canonical")
+    times = {
+        field: _utc(getattr(context, field))
+        for field in (
+            "pre_created_at", "history_cutoff_at", "runtime_ready_at", "snapshot_read_at",
+            "history_available_at",
+        )
+    }
+    if (
+        times["history_cutoff_at"] != interactive_cutoff(times["pre_created_at"])
+        or not times["snapshot_read_at"] <= times["runtime_ready_at"] <= times["pre_created_at"]
+        or times["history_available_at"] > times["runtime_ready_at"]
+    ):
+        _fail("E_MODEL_TIMESTAMP_INVALID", "Runtime availability or explicit cutoff is inconsistent")
+    planned = None if context.planned_start_at is None else _utc(context.planned_start_at)
+    return replace(context, **times, planned_start_at=planned)
 
 
 def _plain(value):
@@ -491,6 +577,66 @@ def _model_frame(frame, phase):
             if len(set(row)) != 10:
                 _fail("E_MODEL_VALUE_INVALID", "POST must retain ten distinct champion identities")
     return result
+
+
+def _interactive_context_metadata(metadata, index, expected):
+    if _contract_protocol(expected) != RETROSPECTIVE_PROTOCOL:
+        _fail("E_MODEL_SCHEMA", "Interactive inference requires a retrospective-trained bundle")
+    if (
+        not isinstance(metadata, pd.DataFrame)
+        or tuple(metadata.columns) != INTERACTIVE_CONTEXT_COLUMNS
+        or not metadata.index.is_unique
+        or not metadata.index.equals(index)
+        or metadata.empty
+    ):
+        _fail("E_MODEL_ALIGNMENT", "Interactive context must exactly align with feature rows")
+    normalized = metadata.copy(deep=True)
+    for analysis_id in index:
+        row = metadata.loc[analysis_id]
+        context = validate_runtime_context(row["runtime_context"])
+        config = row["pre_config"]
+        if not isinstance(config, FeatureConfig) or any(
+            type(value) is not int or value <= 0
+            for value in (config.recent_form_games, config.side_win_rate_games, config.head_to_head_games)
+        ):
+            _fail("E_MODEL_SCHEMA", "Invalid PRE feature configuration")
+        pre_version = (
+            f"pre-v1-r{config.recent_form_games}-s{config.side_win_rate_games}"
+            f"-h{config.head_to_head_games}-roster-latest1"
+        )
+        if (
+            config != expected.pre_config
+            or row["pre_config_version"] != pre_version
+            or row["pre_config_version"] != expected.pre_config_version
+            or row["post_config_version"] != "post-v1-player-champion-all-pre-history"
+            or row["post_config_version"] != expected.post_config_version
+            or analysis_id != context.analysis_id
+        ):
+            _fail("E_MODEL_SCHEMA", "Interactive features differ from the fitted feature contract")
+        target = select_pre_history(
+            TargetGame(
+                analysis_id, row["blue_team_id"], row["red_team_id"], row["blue_roster"],
+                row["red_roster"], row["patch"], row["history_cutoff_at"],
+            ),
+            (),
+        ).target
+        if target.history_cutoff_at != context.history_cutoff_at:
+            _fail("E_MODEL_TIMESTAMP_INVALID", "Target cutoff differs from the runtime context")
+        history_ids = row["history_game_ids"]
+        if (
+            not isinstance(history_ids, tuple)
+            or any(not isinstance(value, str) for value in history_ids)
+            or len(set(history_ids)) != len(history_ids)
+            or not set(history_ids) <= set(context.history_pool_game_ids)
+        ):
+            _fail("E_MODEL_METADATA_INVALID", "Selected history differs from the retained pool")
+        normalized.at[analysis_id, "history_cutoff_at"] = target.history_cutoff_at
+        normalized.at[analysis_id, "runtime_context"] = context
+        for column in ("blue_roster", "red_roster"):
+            normalized.at[analysis_id, column] = tuple(
+                sorted(getattr(target, column), key=lambda slot: ROLES.index(slot.role))
+            )
+    return normalized
 
 
 def _prepare_dataset(dataset, *, evaluation_protocol=STRICT_PROTOCOL):
@@ -896,11 +1042,16 @@ def _check_bundle(bundle):
             _fail("E_MODEL_CLASSES_INVALID", "Estimator must expose binary classes 0 and 1")
 
 
-def predict_phase(bundle, phase, features, metadata):
+def predict_phase(bundle, phase, features, metadata, *, inference_policy=None):
     """Label-free prediction; no target ended_at is required."""
     _check_bundle(bundle)
     frame = _model_frame(features, phase)
-    context, _contract = _context_metadata(metadata, frame.index, bundle.contract)
+    if inference_policy is None:
+        context, _contract = _context_metadata(metadata, frame.index, bundle.contract)
+    elif isinstance(inference_policy, str) and inference_policy == INTERACTIVE_INFERENCE_POLICY:
+        context = _interactive_context_metadata(metadata, frame.index, bundle.contract)
+    else:
+        _fail("E_MODEL_SCHEMA", "Unsupported inference context policy")
     pipeline = bundle.pre_pipeline if phase == "PRE" else bundle.post_pipeline
     probabilities = _blue_probability(pipeline, frame)
     predictions = []
@@ -915,8 +1066,14 @@ def predict_phase(bundle, phase, features, metadata):
                 model_bundle_version=bundle.identity.bundle_version,
                 bundle_signature=bundle.fit_signature,
                 feature_schema_version=bundle.feature_schema_version,
-                policy_version=row["policy_version"],
-                context_signature=_digest((game_id, row.to_dict())),
+                policy_version=(
+                    row["policy_version"] if inference_policy is None else inference_policy
+                ),
+                context_signature=(
+                    _digest((game_id, row.to_dict())) if inference_policy is None else _digest(
+                        (inference_policy, _contract_protocol(bundle.contract), game_id, row.to_dict())
+                    )
+                ),
                 pre_feature_signature=_digest(
                     frame.loc[game_id, list(PRE_COLUMNS)].to_dict()
                 ),

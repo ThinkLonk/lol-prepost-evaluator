@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-_STABLE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_STABLE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
 _IMAGE_EXTENSIONS = (
     ".png",
     ".jpg",
@@ -68,6 +68,7 @@ def canonical_key(value: str) -> str:
 
 def bounded(value: str, field_name: str, maximum: int) -> str:
     """Kiểm tra độ dài tương thích với cột PostgreSQL."""
+
     if len(value) > maximum:
         raise ValueError(f"{field_name} dài {len(value)} ký tự, vượt giới hạn {maximum}.")
 
@@ -79,7 +80,7 @@ def validate_stable_id(
     field_name: str,
     maximum: int,
 ) -> str:
-    """Kiểm tra stable ID và ngăn ký tự không an toàn cho tên file."""
+    """Kiểm tra cú pháp và độ dài stable ID; chưa mã hóa thành tên file."""
     cleaned = clean_label(value, field_name)
 
     if len(cleaned) > maximum:
@@ -87,7 +88,7 @@ def validate_stable_id(
 
     if _STABLE_ID_PATTERN.fullmatch(cleaned) is None:
         raise ValueError(
-            f"{field_name} chỉ được chứa chữ, số, dấu chấm, gạch dưới hoặc gạch ngang."
+            f"{field_name} chỉ được chứa chữ, số, dấu chấm, gạch dưới, hai chấm hoặc gạch ngang."
         )
 
     return cleaned
@@ -107,13 +108,14 @@ def _filename_slug(value: str) -> str:
 
 
 def asset_stem(stable_id: str, canonical_name: str) -> str:
-    """Tạo phần tên file chưa có extension."""
+    """Tạo tên media, phân biệt dấu phân cách namespace với gạch dưới."""
     safe_id = validate_stable_id(
         stable_id,
         field_name="stable_id",
         maximum=100,
     )
-    return f"{safe_id}-{_filename_slug(canonical_name)}"
+    encoded_id = safe_id.replace(":", "~")
+    return f"{encoded_id}-{_filename_slug(canonical_name)}"
 
 
 def _detect_image_extension(payload: bytes) -> str:

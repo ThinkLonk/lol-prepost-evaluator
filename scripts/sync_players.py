@@ -16,6 +16,7 @@ from match_insight.data_processing.leaguepedia import (
     LEAGUEPEDIA_API_URL,
     LEAGUEPEDIA_CLIENT_NAME,
 )
+from match_insight.data_processing.media_policy import load_media_exclusions
 from match_insight.data_processing.players import (
     PlayerRecord,
     delete_pruned_player_media,
@@ -1413,6 +1414,15 @@ def main() -> None:
     if args.print_browser_exporter:
         print(dedent(_BROWSER_EXPORTER).strip())
         return
+
+    excluded_ids = load_media_exclusions(PROJECT_ROOT, "players")
+    if excluded_ids and (
+        args.prune_missing or args.prune_media or refresh_changed_media
+    ):
+        raise ValueError(
+            "Media exclusions are active. Use normal metadata/media sync; "
+            "legacy prune and changed-media refresh require a separate scope review."
+        )
 
     if args.prune_media and not args.prune_missing:
         raise ValueError(

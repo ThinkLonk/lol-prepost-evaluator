@@ -14,6 +14,7 @@ from match_insight.data_processing.leaguepedia import (
     fetch_cargo_rows,
     fetch_file_urls,
 )
+from match_insight.data_processing.media_policy import load_media_exclusions
 from match_insight.data_processing.reference_common import (
     SyncStats,
     asset_stem,
@@ -374,6 +375,7 @@ def sync_teams(
     """Tải logo và upsert team theo team_id."""
     stats = SyncStats()
     asset_dir = project_root / "assets" / "teams"
+    excluded_ids = load_media_exclusions(project_root, "teams")
     team_ids = [record.team_id for record in records]
 
     if len(team_ids) != len(set(team_ids)):
@@ -417,7 +419,9 @@ def sync_teams(
         team = session.get(Team, team_id)
         logo_file = team.logo_file if team is not None else None
 
-        if record.logo_url is not None:
+        if record.logo_url is not None and team_id in excluded_ids:
+            stats.media_skipped += 1
+        if record.logo_url is not None and team_id not in excluded_ids:
             logo_file, downloaded = download_image(
                 url=record.logo_url,
                 asset_dir=asset_dir,

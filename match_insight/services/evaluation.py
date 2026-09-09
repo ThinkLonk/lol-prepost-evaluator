@@ -39,15 +39,20 @@ from match_insight.ml.dataset import (
 )
 from match_insight.ml.models import (
     CONTEXT_COLUMNS,
+    INTERACTIVE_CONTEXT_COLUMNS,
+    INTERACTIVE_INFERENCE_POLICY,
     ModelBundle,
     PairedPrediction,
     PhasePrediction,
+    RuntimeInferenceContext,
     _check_bundle,
     _contract_protocol,
     _digest,
+    _plain,
     _utc,
     compare_predictions,
     predict_phase,
+    validate_runtime_context,
 )
 from match_insight.ml.real_training import (
     CANONICAL_RETROSPECTIVE_EXPECTATION,
@@ -68,6 +73,7 @@ class EvaluationRequest:
     cutoff: CutoffRecord | None
     history: tuple[HistoricalChampionGame, ...]
     champion_reference: frozenset[str]
+    runtime_context: RuntimeInferenceContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,12 +120,51 @@ def _fail(code, detail):
     raise EvaluationInputError(code, detail)
 
 
-def _prepare_request(request, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
+def _require_canonical_bundle(bundle):
+    _check_bundle(bundle)
+    expected = CANONICAL_RETROSPECTIVE_EXPECTATION
+    if (
+        _contract_protocol(bundle.contract) != RETROSPECTIVE_PROTOCOL
+        or bundle.identity != expected.identity
+        or bundle.family != expected.family
+    ):
+        _fail("E_EVAL_INCOMPATIBLE", "Expected the canonical retrospectively trained bundle")
+
+
+def _interactive_context(request, bundle):
+    """Validate the complete interactive branch without manufacturing a CutoffRecord."""
+    _require_canonical_bundle(bundle)
+    if request.cutoff is not None:
+        _fail("E_EVAL_INCOMPATIBLE", "Interactive context cannot include a benchmark cutoff record")
+    context = validate_runtime_context(request.runtime_context)
+    if (
+        request.target.game_id != context.analysis_id
+        or _utc(request.target.history_cutoff_at) != context.history_cutoff_at
+    ):
+        _fail("E_EVAL_INCOMPATIBLE", "Target differs from the locked interactive context")
+    ids = tuple(record.game.game_id for record in request.history)
+    if any(not isinstance(game_id, str) for game_id in ids):
+        _fail("E_HISTORY_INPUT_INVALID", "History identities must be canonical strings")
+    if len(set(ids)) != len(ids):
+        _fail("E_HISTORY_DUPLICATE_GAME_ID", "History contains duplicate game identities")
+    if tuple(sorted(ids)) != context.history_pool_game_ids:
+        _fail("E_PRE_HISTORY_MISMATCH", "Request differs from the declared approved history pool")
+    return context
+
+
+def _prepare_request(
+    request, bundle, *, evaluation_protocol=STRICT_PROTOCOL, inference_policy=None,
+):
     if not isinstance(request, EvaluationRequest) or not isinstance(request.target, TargetGame):
         _fail("E_PRE_INPUT_INCOMPLETE", "Expected an EvaluationRequest and TargetGame")
-    _check_bundle(bundle)
-    if _contract_protocol(bundle.contract) != evaluation_protocol:
-        _fail("E_EVAL_INCOMPATIBLE", "Requested protocol differs from the model contract")
+    if inference_policy is None:
+        if request.runtime_context is not None:
+            _fail("E_EVAL_INCOMPATIBLE", "Runtime context requires explicit interactive inference")
+        _check_bundle(bundle)
+        if _contract_protocol(bundle.contract) != evaluation_protocol:
+            _fail("E_EVAL_INCOMPATIBLE", "Requested protocol differs from the model contract")
+    elif inference_policy != INTERACTIVE_INFERENCE_POLICY or evaluation_protocol != STRICT_PROTOCOL:
+        _fail("E_EVAL_INCOMPATIBLE", "Unsupported or mixed inference policy")
     _require_reference(request.champion_reference)
     owned = deepcopy(request)
     try:
@@ -156,6 +201,10 @@ def _prepare_request(request, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
 
     # Validate context with the existing PRE validator, without creating features.
     target = select_pre_history(target, ()).target
+    if inference_policy == INTERACTIVE_INFERENCE_POLICY:
+        normalized = replace(owned, target=target, history=history)
+        context = _interactive_context(normalized, bundle)
+        return replace(normalized, runtime_context=context)
     if owned.cutoff is not None and not isinstance(owned.cutoff, CutoffRecord):
         _fail("E_CUTOFF_STATUS_INVALID", "Expected CutoffRecord")
     if owned.cutoff is not None and owned.cutoff.game_id != target.game_id:
@@ -189,25 +238,28 @@ def _request_key(request, bundle):
         else record
         for record in request.history
     )
-    return _digest(
-        (
-            request.target,
-            request.cutoff,
-            history_entries,
-            tuple(sorted(request.champion_reference)),
-            bundle.identity,
-            bundle.fit_signature,
-            bundle.contract,
-            bundle.feature_schema_version,
-            bundle.preprocessing_version,
-            bundle.library_versions,
-        )
+    fields = (
+        request.target,
+        request.cutoff,
+        history_entries,
+        tuple(sorted(request.champion_reference)),
+        bundle.identity,
+        bundle.fit_signature,
+        bundle.contract,
+        bundle.feature_schema_version,
+        bundle.preprocessing_version,
+        bundle.library_versions,
     )
+    if request.runtime_context is not None:
+        fields += (request.runtime_context,)
+    return _digest(fields)
 
 
-def request_key(request, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
+def request_key(request, bundle, *, evaluation_protocol=STRICT_PROTOCOL, inference_policy=None):
     """Validate and identify the complete PRE foundation."""
-    normalized = _prepare_request(request, bundle, evaluation_protocol=evaluation_protocol)
+    normalized = _prepare_request(
+        request, bundle, evaluation_protocol=evaluation_protocol, inference_policy=inference_policy,
+    )
     return _request_key(normalized, bundle)
 
 
@@ -231,11 +283,6 @@ def _prediction_inputs(request, pre, bundle, post=None):
         "red_team_id": target.red_team_id,
         "blue_roster": target.blue_roster,
         "red_roster": target.red_roster,
-        "evidence_ref": request.cutoff.evidence_ref,
-        "policy_version": request.cutoff.policy_version,
-        "cutoff_verification": request.cutoff.verification.value,
-        "core_cutoff_verification": pre.metadata.cutoff_verification,
-        "dataset_version": bundle.contract.dataset_version,
         "pre_config_version": pre.metadata.config_version,
         # Expected schema only; this does not manufacture a POST snapshot.
         "post_config_version": bundle.contract.post_config_version,
@@ -247,6 +294,18 @@ def _prediction_inputs(request, pre, bundle, post=None):
         "history_exclusions": pre.exclusions,
         "history_counts": pre.counts,
     }
+    if request.runtime_context is None:
+        metadata.update(
+            evidence_ref=request.cutoff.evidence_ref,
+            policy_version=request.cutoff.policy_version,
+            cutoff_verification=request.cutoff.verification.value,
+            core_cutoff_verification=pre.metadata.cutoff_verification,
+            dataset_version=bundle.contract.dataset_version,
+        )
+        context_columns = CONTEXT_COLUMNS
+    else:
+        metadata["runtime_context"] = request.runtime_context
+        context_columns = INTERACTIVE_CONTEXT_COLUMNS
     columns = PRE_COLUMNS
     if post is not None:
         columns = POST_COLUMNS
@@ -262,7 +321,7 @@ def _prediction_inputs(request, pre, bundle, post=None):
     context = pd.DataFrame(
         [metadata],
         index=index,
-        columns=CONTEXT_COLUMNS,
+        columns=context_columns,
         dtype=object,
     )
     return frame, context
@@ -293,11 +352,14 @@ def _seal(snapshot):
     )
 
 
-def _require_snapshot(pre, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
+def _require_snapshot(pre, bundle, *, evaluation_protocol=STRICT_PROTOCOL, inference_policy=None):
     if not isinstance(pre, PreSnapshot):
         _fail("E_PRE_SNAPSHOT_REQUIRED", "Create PRE before creating POST")
     try:
-        expected_key = request_key(pre.request, bundle, evaluation_protocol=evaluation_protocol)
+        expected_key = request_key(
+            pre.request, bundle,
+            evaluation_protocol=evaluation_protocol, inference_policy=inference_policy,
+        )
     except PreFeatureInputError:
         _fail("E_EVAL_INCOMPATIBLE", "The saved PRE foundation is no longer compatible")
     if pre.context_key != expected_key or pre.seal != _seal(pre):
@@ -311,16 +373,24 @@ def create_pre(
     bundle: ModelBundle,
     *,
     evaluation_protocol=STRICT_PROTOCOL,
+    inference_policy=None,
 ):
     """Create PRE without target champions, winner or target end."""
-    normalized = _prepare_request(request, bundle, evaluation_protocol=evaluation_protocol)
+    normalized = _prepare_request(
+        request, bundle, evaluation_protocol=evaluation_protocol, inference_policy=inference_policy,
+    )
     features = build_pre_features(
         normalized.target,
         tuple(record.game for record in normalized.history),
         bundle.contract.pre_config,
     )
     frame, metadata = _prediction_inputs(normalized, features, bundle)
-    prediction = predict_phase(bundle, "PRE", frame, metadata)[0]
+    if inference_policy is None:
+        prediction = predict_phase(bundle, "PRE", frame, metadata)[0]
+    else:
+        prediction = predict_phase(
+            bundle, "PRE", frame, metadata, inference_policy=inference_policy,
+        )[0]
     snapshot = PreSnapshot(
         request=normalized,
         features=features,
@@ -332,10 +402,17 @@ def create_pre(
     return replace(snapshot, seal=_seal(snapshot))
 
 
+def evaluate_interactive_pre(request: EvaluationRequest, bundle: ModelBundle) -> PreSnapshot:
+    """Evaluate a user-confirmed analysis with its locked runtime cutoff and loaded model."""
+    return create_pre(request, bundle, inference_policy=INTERACTIVE_INFERENCE_POLICY)
+
+
 def _require_retrospective_cutoff(request, target_started_at):
     """Check the explicit protocol cutoff without changing the supplied context."""
     if not isinstance(request, EvaluationRequest) or not isinstance(request.target, TargetGame):
         _fail("E_PRE_INPUT_INCOMPLETE", "Expected an EvaluationRequest and TargetGame")
+    if request.runtime_context is not None:
+        _fail("E_EVAL_INCOMPATIBLE", "Retrospective evaluation cannot accept interactive context")
     if request.cutoff is None:
         _fail("E_CUTOFF_MISSING", "An explicit retrospective cutoff record is required")
     if not isinstance(request.cutoff, CutoffRecord):
@@ -405,9 +482,13 @@ def lineup_from_ids(pre, champion_ids):
     return FinalLineup(target.game_id, target.patch, tuple(slots))
 
 
-def validate_final_lineup(pre, lineup, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
+def validate_final_lineup(
+    pre, lineup, bundle, *, evaluation_protocol=STRICT_PROTOCOL, inference_policy=None,
+):
     """Validation for UI gating; use the same slot validator as step 7H."""
-    _require_snapshot(pre, bundle, evaluation_protocol=evaluation_protocol)
+    _require_snapshot(
+        pre, bundle, evaluation_protocol=evaluation_protocol, inference_policy=inference_policy,
+    )
     if not isinstance(lineup, FinalLineup):
         _fail("E_LINEUP_INCOMPLETE", "Expected FinalLineup")
     target = pre.request.target
@@ -418,10 +499,11 @@ def validate_final_lineup(pre, lineup, bundle, *, evaluation_protocol=STRICT_PRO
     return replace(lineup, slots=slots)
 
 
-def create_post(pre, lineup, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
+def create_post(pre, lineup, bundle, *, evaluation_protocol=STRICT_PROTOCOL, inference_policy=None):
     """Create POST against the saved PRE; never recompute its probability."""
     lineup = validate_final_lineup(
-        pre, lineup, bundle, evaluation_protocol=evaluation_protocol,
+        pre, lineup, bundle,
+        evaluation_protocol=evaluation_protocol, inference_policy=inference_policy,
     )
     features = build_post_features(
         pre.features,
@@ -430,7 +512,12 @@ def create_post(pre, lineup, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
         pre.request.champion_reference,
     )
     frame, metadata = _prediction_inputs(pre.request, pre.features, bundle, features)
-    prediction = predict_phase(bundle, "POST", frame, metadata)[0]
+    if inference_policy is None:
+        prediction = predict_phase(bundle, "POST", frame, metadata)[0]
+    else:
+        prediction = predict_phase(
+            bundle, "POST", frame, metadata, inference_policy=inference_policy,
+        )[0]
     comparison = compare_predictions(pre.prediction, prediction)
     missing_pairs = sum(feature.missing for feature in features.player_champion)
     warnings = pre.warnings
@@ -439,6 +526,11 @@ def create_post(pre, lineup, bundle, *, evaluation_protocol=STRICT_PROTOCOL):
             BusinessWarning("W_PAIR_HISTORY_MISSING", sample_count=missing_pairs),
         )
     return PostSnapshot(pre, lineup, features, prediction, comparison, warnings)
+
+
+def evaluate_interactive_post(pre: PreSnapshot, lineup: FinalLineup, bundle: ModelBundle) -> PostSnapshot:
+    """Add the supplied final lineup while retaining the exact interactive PRE foundation."""
+    return create_post(pre, lineup, bundle, inference_policy=INTERACTIVE_INFERENCE_POLICY)
 
 
 def evaluate_retrospective_post(
@@ -459,36 +551,45 @@ def evaluate_retrospective_post(
     return create_post(pre, lineup, bundle, evaluation_protocol=RETROSPECTIVE_PROTOCOL)
 
 
-def compare_retrospective_evaluations(pre, post, bundle):
-    """Present the saved comparison from the canonical retrospective runtime.
-
-    Inputs are service-created snapshots and an already loaded bundle. Artifact
-    hashing and snapshot sealing remain at their existing creation boundaries;
-    this function performs no I/O, hashing, inference or feature construction.
-    """
+def _checked_comparison(pre, post, bundle, *, inference_policy=None):
+    """Share saved-pair validation while keeping each cutoff branch explicit."""
     if not isinstance(pre, PreSnapshot) or not isinstance(post, PostSnapshot):
         _fail("E_EVAL_INCOMPATIBLE", "Expected saved PRE and POST snapshots")
-    _check_bundle(bundle)
-    expected = CANONICAL_RETROSPECTIVE_EXPECTATION
-    if (
-        _contract_protocol(bundle.contract) != RETROSPECTIVE_PROTOCOL
-        or bundle.identity != expected.identity
-        or bundle.family != expected.family
-    ):
-        _fail("E_EVAL_INCOMPATIBLE", "Comparison requires the canonical retrospective runtime")
+    _require_canonical_bundle(bundle)
     if (
         not isinstance(post.pre, PreSnapshot)
         or post.pre != pre
         or not isinstance(post.features, PostFeatureResult)
         or post.features.pre != pre.features
         or not isinstance(pre.request, EvaluationRequest)
-        or not isinstance(pre.request.cutoff, CutoffRecord)
     ):
         _fail("E_EVAL_INCOMPATIBLE", "POST does not preserve the supplied PRE foundation")
 
     target = _require_pre_context(pre.features)
-    if pre.request.target != target or pre.request.cutoff.game_id != target.game_id:
+    if pre.request.target != target:
         _fail("E_EVAL_INCOMPATIBLE", "Saved request differs from the PRE context")
+    if inference_policy == INTERACTIVE_INFERENCE_POLICY:
+        # Interactive provenance is sealed in the PRE key; verify it without any I/O.
+        _require_snapshot(pre, bundle, inference_policy=INTERACTIVE_INFERENCE_POLICY)
+        runtime_context = _interactive_context(pre.request, bundle)
+        cutoff = runtime_context.history_cutoff_at
+        policy_version = INTERACTIVE_INFERENCE_POLICY
+    elif inference_policy is None:
+        if (
+            pre.request.runtime_context is not None
+            or not isinstance(pre.request.cutoff, CutoffRecord)
+            or pre.request.cutoff.game_id != target.game_id
+        ):
+            _fail("E_EVAL_INCOMPATIBLE", "Expected the saved retrospective cutoff record")
+        _record, cutoff = _resolve_cutoff(
+            target.game_id,
+            (pre.request.cutoff,),
+            frozenset(bundle.contract.cutoff_policy_versions),
+            evaluation_protocol=RETROSPECTIVE_PROTOCOL,
+        )
+        policy_version = RETROSPECTIVE_PROTOCOL
+    else:
+        _fail("E_EVAL_INCOMPATIBLE", "Unsupported inference policy")
     history = pre.request.history
     if not isinstance(history, tuple) or any(
         not isinstance(record, HistoricalChampionGame)
@@ -509,12 +610,6 @@ def compare_retrospective_evaluations(pre, post, bundle):
         )
     ):
         _fail("E_EVAL_INCOMPATIBLE", "Saved history differs from the PRE selection")
-    _record, cutoff = _resolve_cutoff(
-        target.game_id,
-        (pre.request.cutoff,),
-        frozenset(bundle.contract.cutoff_policy_versions),
-        evaluation_protocol=RETROSPECTIVE_PROTOCOL,
-    )
     if (
         _utc(target.history_cutoff_at) != cutoff
         or pre.features.metadata.config != bundle.contract.pre_config
@@ -551,7 +646,7 @@ def compare_retrospective_evaluations(pre, post, bundle):
     if (
         checked.game_id != target.game_id
         or checked.history_cutoff_at != cutoff
-        or checked.policy_version != RETROSPECTIVE_PROTOCOL
+        or checked.policy_version != policy_version
         or checked.model_bundle_version != bundle.identity.bundle_version
         or pre.prediction.bundle_signature != bundle.fit_signature
         or checked.feature_schema_version != bundle.feature_schema_version
@@ -595,6 +690,10 @@ def compare_retrospective_evaluations(pre, post, bundle):
             warning.requested_count,
         ),
     )
+    return comparison, warnings
+
+
+def _comparison_document(comparison, warnings, bundle):
     return {
         "game_id": comparison.game_id,
         "history_cutoff_at": _utc(comparison.history_cutoff_at).isoformat(),
@@ -632,6 +731,32 @@ def compare_retrospective_evaluations(pre, post, bundle):
             for warning in warnings
         ],
     }
+
+
+def compare_retrospective_evaluations(pre, post, bundle):
+    """Present the canonical saved pair without I/O, hashing, features or inference."""
+    comparison, warnings = _checked_comparison(pre, post, bundle)
+    return _comparison_document(comparison, warnings, bundle)
+
+
+def compare_interactive_evaluations(pre, post, bundle):
+    """Verify sealed interactive provenance and present the saved pair without I/O or inference."""
+    comparison, warnings = _checked_comparison(
+        pre, post, bundle, inference_policy=INTERACTIVE_INFERENCE_POLICY,
+    )
+    result = _comparison_document(comparison, warnings, bundle)
+    result["model"].update(
+        data_kind=result.pop("data_kind"),
+        evaluation_protocol=result.pop("evaluation_protocol"),
+    )
+    context = pre.request.runtime_context
+    result.update(
+        inference_mode=context.inference_mode,
+        analysis_id=context.analysis_id,
+        inference_policy=INTERACTIVE_INFERENCE_POLICY,
+        runtime_context=_plain(context),
+    )
+    return result
 
 
 def refresh_state(state, request, bundle, champion_ids):

@@ -3,7 +3,7 @@
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from math import isfinite, nextafter
 
@@ -31,9 +31,12 @@ from match_insight.services.evaluation import (
     EvaluationInputError,
     EvaluationState,
     PreSnapshot,
+    compare_interactive_evaluations,
     compare_retrospective_evaluations,
     create_post,
     create_pre,
+    evaluate_interactive_post,
+    evaluate_interactive_pre,
     evaluate_retrospective_post,
     evaluate_retrospective_pre,
     lineup_from_ids,
@@ -1760,3 +1763,360 @@ def test_retrospective_comparison_binds_saved_pair_identities_to_lineup(
     _forbid_comparison_work(monkeypatch)
     with pytest.raises(PreFeatureInputError, match="E_EVAL_INCOMPATIBLE"):
         compare_retrospective_evaluations(pre, post, bundle)
+
+
+@pytest.fixture
+def interactive_request(monkeypatch, eval_request, retrospective_bundle):
+    created = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    context = models.RuntimeInferenceContext(
+        analysis_id="analysis:123e4567-e89b-42d3-a456-426614174000",
+        pre_created_at=created,
+        history_cutoff_at=models.interactive_cutoff(created),
+        runtime_ready_at=created - timedelta(hours=1),
+        snapshot_read_at=created - timedelta(hours=3),
+        snapshot_sha256="a" * 64,
+        evidence_sha256="b" * 64,
+        history_pool_sha256="c" * 64,
+        history_pool_game_ids=tuple(sorted(record.game.game_id for record in eval_request.history)),
+        history_available_at=created - timedelta(hours=2),
+        context_label="Synthetic user-confirmed analysis",
+        planned_start_at=created + timedelta(hours=2),
+    )
+    monkeypatch.setattr(evaluation, "CANONICAL_RETROSPECTIVE_EXPECTATION", replace(
+        runner.CANONICAL_RETROSPECTIVE_EXPECTATION,
+        identity=retrospective_bundle.identity, family=retrospective_bundle.family,
+    ))
+    return replace(
+        eval_request,
+        target=replace(
+            eval_request.target,
+            game_id=context.analysis_id, history_cutoff_at=context.history_cutoff_at,
+        ),
+        cutoff=None,
+        runtime_context=context,
+    )
+
+
+def _forbid_interactive_io(monkeypatch):
+    _forbid_runtime_training(monkeypatch)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Interactive inference must use the supplied bundle without I/O")
+
+    monkeypatch.setattr(evaluation, "load_retrospective_bundle", forbidden)
+    monkeypatch.setattr(runner, "load_retrospective_bundle", forbidden)
+    monkeypatch.setattr(models, "load_bundle", forbidden)
+    monkeypatch.setattr(models.joblib, "load", forbidden)
+    monkeypatch.setattr(evaluation, "_resolve_cutoff", forbidden)
+
+
+def test_interactive_core_flow_without_db_target_or_fake_cutoff_is_serializable(
+    monkeypatch, interactive_request, retrospective_bundle,
+):
+    source = interactive_request.history[0]
+    cutoff = interactive_request.target.history_cutoff_at
+    excluded = tuple(
+        replace(source, game=replace(source.game, game_id=identity, ended_at=end))
+        for identity, end in (
+            ("at-cutoff", cutoff),
+            ("after-cutoff", cutoff + timedelta(hours=1)),
+            ("missing-end", None),
+        )
+    )
+    history = interactive_request.history + excluded
+    request = replace(interactive_request, history=history, runtime_context=replace(
+        interactive_request.runtime_context,
+        history_pool_game_ids=tuple(sorted(record.game.game_id for record in history)),
+    ))
+    before = deepcopy(request)
+    _forbid_interactive_io(monkeypatch)
+    original_predict = evaluation.predict_phase
+    predicted = []
+
+    def predict(bundle, phase, features, metadata, *, inference_policy=None):
+        assert inference_policy == models.INTERACTIVE_INFERENCE_POLICY
+        assert tuple(metadata.columns) == models.INTERACTIVE_CONTEXT_COLUMNS
+        assert metadata.iloc[0]["runtime_context"] == request.runtime_context
+        assert "cutoff_verification" not in metadata.columns
+        assert "policy_version" not in metadata.columns
+        predicted.append(phase)
+        return original_predict(bundle, phase, features, metadata, inference_policy=inference_policy)
+
+    monkeypatch.setattr(evaluation, "predict_phase", predict)
+    pre = evaluate_interactive_pre(request, retrospective_bundle)
+    assert request == before
+    assert pre.request.cutoff is None
+    assert pre.request.runtime_context == request.runtime_context
+    assert not hasattr(pre.request.target, "started_at")
+    assert not hasattr(pre.request.target, "winner_team_id")
+    assert not hasattr(pre.request.target, "final_lineup")
+    assert pre.request.target.game_id not in request.runtime_context.history_pool_game_ids
+    assert set(pre.features.accepted_game_ids) == {
+        record.game.game_id for record in interactive_request.history
+    }
+    assert {item.game_id: item.reason for item in pre.features.exclusions} == {
+        "at-cutoff": "END_NOT_BEFORE_CUTOFF",
+        "after-cutoff": "END_NOT_BEFORE_CUTOFF",
+        "missing-end": "MISSING_ENDED_AT",
+    }
+    assert pre.features.counts.input_games == 5
+    assert pre.features.counts.accepted_games == 2
+    assert pre.features.blue.recent_form.sample_count == 2
+    assert pre.features.blue.recent_form.value == 0.5
+    assert pre.prediction.policy_version == models.INTERACTIVE_INFERENCE_POLICY
+    assert pre.prediction.history_cutoff_at == cutoff
+    lineup = lineup_from_ids(pre, CHAMPION_IDS)
+    post = evaluate_interactive_post(pre, lineup, retrospective_bundle)
+    assert post.pre is pre
+    assert post.features.pre is pre.features
+    assert post.features.accepted_game_ids == pre.features.accepted_game_ids
+    assert all(pair.games_count == 2 and pair.wins_count == 1 for pair in post.features.player_champion)
+    assert predicted == ["PRE", "POST"]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Interactive comparison cannot build features or predict")
+
+    for name in ("build_pre_features", "build_post_features", "predict_phase"):
+        monkeypatch.setattr(evaluation, name, forbidden)
+    monkeypatch.setattr(models.Pipeline, "predict_proba", forbidden)
+    saved = deepcopy((pre, post))
+    result = compare_interactive_evaluations(pre, post, retrospective_bundle)
+    assert result == compare_interactive_evaluations(pre, post, retrospective_bundle)
+    assert (pre, post) == saved
+    assert json.loads(json.dumps(result, allow_nan=False)) == result
+    assert result["analysis_id"] == pre.request.target.game_id
+    assert result["inference_mode"] == "INTERACTIVE_ANALYSIS"
+    assert result["inference_policy"] == models.INTERACTIVE_INFERENCE_POLICY
+    assert result["runtime_context"] == models._plain(request.runtime_context)
+    assert "data_kind" not in result and "evaluation_protocol" not in result
+    assert result["model"]["data_kind"] == "REAL_RETROSPECTIVE_SIMULATION"
+    assert result["model"]["evaluation_protocol"] == RETROSPECTIVE_PROTOCOL
+    assert result["model"]["dataset_id"] == retrospective_bundle.identity.dataset_id
+    assert result["pre"]["blue_win_probability"] == pre.prediction.p_blue_win
+    assert result["post"]["blue_win_probability"] == post.prediction.p_blue_win
+    assert result["comparison"]["blue_probability_delta"] == post.comparison.delta_probability
+    assert result["comparison"]["red_probability_delta"] == -post.comparison.delta_probability
+    for phase in ("pre", "post"):
+        assert result[phase]["blue_win_probability"] + result[phase]["red_win_probability"] == 1.0
+
+
+@pytest.mark.parametrize("change", [
+    "missing_context", "fake_cutoff", "analysis_id", "cutoff", "confirmation", "future_ready",
+    "future_availability", "pool_ids", "pool_duplicate", "strict_bundle", "canonical_identity",
+])
+def test_interactive_rejects_invalid_context_before_features_or_prediction(
+    monkeypatch, interactive_request, retrospective_bundle, bundle, change,
+):
+    request = interactive_request
+    model = retrospective_bundle
+    context = request.runtime_context
+    if change == "missing_context":
+        request = replace(request, runtime_context=None)
+    elif change == "fake_cutoff":
+        request = replace(request, cutoff=CutoffRecord(
+            request.target.game_id, context.history_cutoff_at, "synthetic://not-allowed",
+            RETROSPECTIVE_PROTOCOL, CutoffVerification.PROTOCOL_ASSUMED,
+        ))
+    elif change == "analysis_id":
+        request = replace(request, target=replace(request.target, game_id="analysis:different"))
+    elif change == "cutoff":
+        request = replace(request, target=replace(
+            request.target, history_cutoff_at=context.history_cutoff_at + timedelta(seconds=1),
+        ))
+    elif change == "confirmation":
+        request = replace(request, runtime_context=replace(context, user_confirmed=False))
+    elif change == "future_ready":
+        request = replace(request, runtime_context=replace(
+            context, runtime_ready_at=context.pre_created_at + timedelta(seconds=1),
+        ))
+    elif change == "future_availability":
+        request = replace(request, runtime_context=replace(
+            context, history_available_at=context.pre_created_at + timedelta(seconds=1),
+        ))
+    elif change == "pool_ids":
+        request = replace(request, runtime_context=replace(context, history_pool_game_ids=()))
+    elif change == "pool_duplicate":
+        request = replace(request, history=request.history + request.history[:1])
+    elif change == "strict_bundle":
+        model = bundle
+    else:
+        model = replace(model, identity=replace(model.identity, bundle_version="other-version"))
+    _forbid_interactive_io(monkeypatch)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid interactive input reached feature construction or prediction")
+
+    monkeypatch.setattr(evaluation, "build_pre_features", forbidden)
+    monkeypatch.setattr(evaluation, "predict_phase", forbidden)
+    before = deepcopy(request)
+    with pytest.raises(PreFeatureInputError):
+        evaluate_interactive_pre(request, model)
+    assert request == before
+
+
+def test_interactive_requires_explicit_branch_and_legacy_protocols_stay_isolated(
+    monkeypatch, interactive_request, retrospective_request, retrospective_bundle,
+):
+    for protocol in (STRICT_PROTOCOL, RETROSPECTIVE_PROTOCOL):
+        with pytest.raises(PreFeatureInputError):
+            create_pre(interactive_request, retrospective_bundle, evaluation_protocol=protocol)
+        with pytest.raises(PreFeatureInputError):
+            evaluation.request_key(
+                interactive_request, retrospective_bundle, evaluation_protocol=protocol,
+            )
+    with pytest.raises(PreFeatureInputError):
+        create_pre(interactive_request, retrospective_bundle, inference_policy="other-policy")
+    with pytest.raises(PreFeatureInputError):
+        create_pre(
+            interactive_request, retrospective_bundle,
+            evaluation_protocol=RETROSPECTIVE_PROTOCOL,
+            inference_policy=models.INTERACTIVE_INFERENCE_POLICY,
+        )
+    with pytest.raises(PreFeatureInputError):
+        evaluate_interactive_pre(retrospective_request, retrospective_bundle)
+    _forbid_interactive_io(monkeypatch)
+    with pytest.raises(PreFeatureInputError):
+        evaluate_retrospective_pre(
+            interactive_request, target_started_at=interactive_request.runtime_context.pre_created_at,
+        )
+    pre = evaluate_interactive_pre(interactive_request, retrospective_bundle)
+    lineup = lineup_from_ids(pre, CHAMPION_IDS)
+    post = evaluate_interactive_post(pre, lineup, retrospective_bundle)
+    for protocol in (STRICT_PROTOCOL, RETROSPECTIVE_PROTOCOL):
+        with pytest.raises(PreFeatureInputError):
+            create_post(pre, lineup, retrospective_bundle, evaluation_protocol=protocol)
+    with pytest.raises(PreFeatureInputError):
+        evaluate_retrospective_post(
+            pre, lineup, target_started_at=interactive_request.runtime_context.pre_created_at,
+        )
+    with pytest.raises(PreFeatureInputError):
+        compare_retrospective_evaluations(pre, post, retrospective_bundle)
+
+
+def test_interactive_runtime_provenance_is_part_of_key_seal_and_saved_pair(
+    monkeypatch, interactive_request, retrospective_bundle,
+):
+    _forbid_interactive_io(monkeypatch)
+    pre = evaluate_interactive_pre(interactive_request, retrospective_bundle)
+    lineup = lineup_from_ids(pre, CHAMPION_IDS)
+    post = evaluate_interactive_post(pre, lineup, retrospective_bundle)
+    context = pre.request.runtime_context
+    changes = {
+        "pre_created_at": context.pre_created_at + timedelta(minutes=1),
+        "runtime_ready_at": context.runtime_ready_at - timedelta(minutes=1),
+        "snapshot_read_at": context.snapshot_read_at - timedelta(minutes=1),
+        "history_available_at": context.history_available_at - timedelta(minutes=1),
+        "snapshot_sha256": "d" * 64,
+        "evidence_sha256": "e" * 64,
+        "history_pool_sha256": "f" * 64,
+        "context_label": "Changed analysis label",
+        "planned_start_at": context.planned_start_at + timedelta(hours=1),
+    }
+    for field, value in changes.items():
+        request = replace(pre.request, runtime_context=replace(context, **{field: value}))
+        assert evaluation.request_key(
+            request, retrospective_bundle, inference_policy=models.INTERACTIVE_INFERENCE_POLICY,
+        ) != pre.context_key
+        changed = replace(pre, request=request)
+        with pytest.raises(PreFeatureInputError, match="E_EVAL_INCOMPATIBLE"):
+            evaluate_interactive_post(changed, lineup, retrospective_bundle)
+        with pytest.raises(PreFeatureInputError, match="E_EVAL_INCOMPATIBLE"):
+            compare_interactive_evaluations(changed, replace(post, pre=changed), retrospective_bundle)
+    with pytest.raises(PreFeatureInputError, match="E_EVAL_INCOMPATIBLE"):
+        evaluate_interactive_post(replace(pre, seal="0" * 64), lineup, retrospective_bundle)
+    assert post.pre is pre
+    assert pre.request.runtime_context == context
+
+
+@pytest.mark.parametrize("change", ["partial", "duplicate", "unknown", "different_player", "cached_delta"])
+def test_interactive_post_and_comparison_reuse_existing_lineup_and_cache_guards(
+    monkeypatch, interactive_request, retrospective_bundle, change,
+):
+    _forbid_interactive_io(monkeypatch)
+    pre = evaluate_interactive_pre(interactive_request, retrospective_bundle)
+    lineup = lineup_from_ids(pre, CHAMPION_IDS)
+    if change == "cached_delta":
+        post = evaluate_interactive_post(pre, lineup, retrospective_bundle)
+        post = replace(post, comparison=replace(post.comparison, delta_probability=0.99))
+        with pytest.raises(PreFeatureInputError, match="E_EVAL_INCOMPATIBLE"):
+            compare_interactive_evaluations(pre, post, retrospective_bundle)
+        return
+    if change == "partial":
+        lineup = replace(lineup, slots=lineup.slots[:-1])
+    else:
+        field = "player_id" if change == "different_player" else "champion_id"
+        value = {
+            "duplicate": CHAMPION_IDS[1], "unknown": "unknown", "different_player": "different",
+        }[change]
+        lineup = replace(lineup, slots=(replace(lineup.slots[0], **{field: value}),) + lineup.slots[1:])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid interactive lineup reached prediction")
+
+    monkeypatch.setattr(evaluation, "predict_phase", forbidden)
+    with pytest.raises(PreFeatureInputError):
+        evaluate_interactive_post(pre, lineup, retrospective_bundle)
+
+
+def test_interactive_empty_history_preserves_missing_values(
+    monkeypatch, interactive_request, retrospective_bundle,
+):
+    _forbid_interactive_io(monkeypatch)
+    request = replace(interactive_request, history=(), runtime_context=replace(
+        interactive_request.runtime_context, history_pool_game_ids=(),
+    ))
+    pre = evaluate_interactive_pre(request, retrospective_bundle)
+    post = evaluate_interactive_post(pre, lineup_from_ids(pre, CHAMPION_IDS), retrospective_bundle)
+    result = compare_interactive_evaluations(pre, post, retrospective_bundle)
+    assert pre.features.blue.recent_form.sample_count == 0
+    assert pre.features.blue.recent_form.value is None
+    assert pre.features.h2h_blue.value is None
+    assert all(pair.games_count == 0 and pair.win_rate is None for pair in post.features.player_champion)
+    assert {warning["code"] for warning in result["warnings"]} == {
+        "W_TEAM_HISTORY_SMALL", "W_H2H_MISSING", "W_PAIR_HISTORY_MISSING",
+    }
+    assert json.loads(json.dumps(result, allow_nan=False)) == result
+
+
+@pytest.mark.parametrize("protocol", [STRICT_PROTOCOL, RETROSPECTIVE_PROTOCOL])
+def test_legacy_request_key_and_seal_match_independent_original_payload(
+    eval_request, retrospective_request, bundle, retrospective_bundle, protocol,
+):
+    request, model = (
+        (eval_request, bundle) if protocol == STRICT_PROTOCOL
+        else (retrospective_request, retrospective_bundle)
+    )
+    pre = create_pre(request, model, evaluation_protocol=protocol)
+
+    def encode(value):
+        if isinstance(value, datetime):
+            return value.astimezone(UTC).isoformat()
+        if is_dataclass(value):
+            return asdict(value)
+        raise TypeError(type(value).__name__)
+
+    def legacy_digest(payload):
+        body = json.dumps(
+            payload, default=encode, sort_keys=True, ensure_ascii=False,
+            separators=(",", ":"), allow_nan=False,
+        )
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    original_key = legacy_digest((
+        pre.request.target,
+        pre.request.cutoff,
+        pre.request.history,
+        tuple(sorted(pre.request.champion_reference)),
+        model.identity,
+        model.fit_signature,
+        model.contract,
+        model.feature_schema_version,
+        model.preprocessing_version,
+        model.library_versions,
+    ))
+    assert pre.request.runtime_context is None
+    assert pre.context_key == original_key
+    assert pre.seal == legacy_digest((original_key, pre.features, pre.prediction, pre.warnings))
+    _frame, metadata = evaluation._prediction_inputs(pre.request, pre.features, model)
+    assert tuple(metadata.columns) == models.CONTEXT_COLUMNS
+    assert "runtime_context" not in metadata.columns

@@ -5,7 +5,7 @@ import json
 import sys
 from copy import deepcopy
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -1232,3 +1232,215 @@ def test_artifact_loader_deserializes_the_verified_buffer_without_reopening(
     restored = load_bundle(path, expected_sha256=metadata["model_sha256"])
     assert restored.identity == bundle.identity
     assert len(reads) == 1
+
+
+def interactive_model_input(dataset):
+    """Synthetic runtime assertions only; no source or clock is certified by this fixture."""
+    created = BASE + timedelta(days=1)
+    row = dataset.metadata.iloc[0]
+    context = models.RuntimeInferenceContext(
+        analysis_id="analysis:synthetic-9fr-a",
+        pre_created_at=created,
+        history_cutoff_at=models.interactive_cutoff(created),
+        runtime_ready_at=created - timedelta(hours=1),
+        snapshot_read_at=created - timedelta(hours=2),
+        snapshot_sha256="a" * 64,
+        evidence_sha256="b" * 64,
+        history_pool_sha256="c" * 64,
+        history_pool_game_ids=tuple(sorted(row["history_game_ids"])),
+        history_available_at=created - timedelta(hours=3),
+        context_label="Synthetic user-provided analysis",
+    )
+    values = {
+        column: row[column]
+        for column in models.INTERACTIVE_CONTEXT_COLUMNS
+        if column != "runtime_context"
+    }
+    values.update(history_cutoff_at=context.history_cutoff_at, runtime_context=context)
+    index = pd.Index([context.analysis_id], name=dataset.X_pre.index.name)
+    metadata = pd.DataFrame([values], index=index, columns=models.INTERACTIVE_CONTEXT_COLUMNS)
+    pre, post = dataset.X_pre.iloc[[0]].copy(deep=True), dataset.X_post.iloc[[0]].copy(deep=True)
+    pre.index = post.index = index
+    return pre, post, metadata, context
+
+
+@pytest.mark.parametrize(
+    ("instant", "expected"),
+    (
+        ("2026-01-01T00:00:00+00:00", "2025-12-31T00:00:00+00:00"),
+        ("2026-01-01T07:00:00+07:00", "2025-12-31T00:00:00+00:00"),
+        ("2026-01-01T00:00:00+07:00", "2025-12-30T00:00:00+00:00"),
+        ("2025-07-02T23:59:59.999999+00:00", "2025-07-01T00:00:00+00:00"),
+    ),
+)
+def test_interactive_cutoff_uses_only_the_supplied_utc_creation_day(instant, expected):
+    assert models.interactive_cutoff(datetime.fromisoformat(instant)) == datetime.fromisoformat(expected)
+
+
+@pytest.mark.parametrize("instant", [None, datetime(2025, 7, 2), pd.NaT, "2025-07-02T12:00:00Z"])
+def test_interactive_cutoff_rejects_nonaware_or_non_datetime_input(instant):
+    with pytest.raises(ModelInputError, match="E_MODEL_TIMESTAMP_INVALID"):
+        models.interactive_cutoff(instant)
+
+
+def test_interactive_prediction_reuses_fitted_pipelines_without_relabelling_artifact(
+    retrospective_fitted, monkeypatch, tmp_path,
+):
+    dataset, _split, bundle = retrospective_fitted
+    pre, post, metadata, context = interactive_model_input(dataset)
+    before = deepcopy((pre, post, metadata))
+    contract_before = deepcopy(bundle.contract)
+    path = tmp_path / "interactive-source.joblib"
+    save_bundle(bundle, path)
+    inventory = artifact_inventory(tmp_path)
+    expected_pre = models._blue_probability(bundle.pre_pipeline, models._model_frame(pre, "PRE"))
+    expected_post = models._blue_probability(bundle.post_pipeline, models._model_frame(post, "POST"))
+    guard_artifact_runtime(monkeypatch)
+    restored = load_bundle(path)
+    kwargs = {"inference_policy": models.INTERACTIVE_INFERENCE_POLICY}
+    first = predict_phase(restored, "PRE", pre, metadata, **kwargs)[0]
+    second = predict_phase(restored, "POST", post, metadata, **kwargs)[0]
+    assert first == predict_phase(restored, "PRE", pre, metadata, **kwargs)[0]
+    assert second == predict_phase(restored, "POST", post, metadata, **kwargs)[0]
+    assert first.p_blue_win == pytest.approx(expected_pre[0])
+    assert second.p_blue_win == pytest.approx(expected_post[0])
+    assert 0 <= first.p_blue_win <= 1 and np.isfinite(first.p_blue_win)
+    assert 0 <= second.p_blue_win <= 1 and np.isfinite(second.p_blue_win)
+    comparison = compare_predictions(first, second)
+    assert comparison.delta_probability == pytest.approx(second.p_blue_win - first.p_blue_win)
+    assert comparison.game_id == context.analysis_id
+    assert comparison.policy_version == models.INTERACTIVE_INFERENCE_POLICY
+    assert first.model_bundle_version == bundle.identity.bundle_version
+    assert restored.contract == bundle.contract == contract_before
+    assert restored.contract.cutoff_policy_versions == (RETROSPECTIVE_PROTOCOL,)
+    assert restored.contract.dataset_version == RETROSPECTIVE_DATASET_VERSION
+    assert models._contract_protocol(restored.contract) == RETROSPECTIVE_PROTOCOL
+    assert first.policy_version != RETROSPECTIVE_PROTOCOL
+    for actual, original in zip((pre, post, metadata), before, strict=True):
+        assert_frame_equal(actual, original)
+    assert artifact_inventory(tmp_path) == inventory
+
+
+def test_interactive_context_normalizes_offsets_without_reading_a_new_clock(retrospective_fitted):
+    dataset, _split, bundle = retrospective_fitted
+    pre, _post, metadata, context = interactive_model_input(dataset)
+    offset = timezone(timedelta(hours=7))
+    shifted = replace(context, **{
+        field: getattr(context, field).astimezone(offset)
+        for field in ("pre_created_at", "history_cutoff_at", "runtime_ready_at", "snapshot_read_at",
+                      "history_available_at")
+    })
+    assert models.validate_runtime_context(shifted) == context
+    changed = metadata.copy(deep=True)
+    changed.at[context.analysis_id, "runtime_context"] = shifted
+    changed.at[context.analysis_id, "history_cutoff_at"] = context.history_cutoff_at.astimezone(offset)
+    kwargs = {"inference_policy": models.INTERACTIVE_INFERENCE_POLICY}
+    assert predict_phase(bundle, "PRE", pre, metadata, **kwargs) == predict_phase(
+        bundle, "PRE", pre, changed, **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["id", "confirmed_false", "confirmed_integer", "source", "verification", "mode", "policy",
+     "hash", "pool_duplicate", "pool_order", "pool_target", "pool_missing", "future_cutoff",
+     "wrong_cutoff", "naive_created", "future_ready", "future_snapshot", "future_availability",
+     "planned_naive", "label"],
+)
+def test_interactive_runtime_context_rejects_invalid_assertions(retrospective_fitted, change):
+    context = interactive_model_input(retrospective_fitted[0])[3]
+    changes = {
+        "id": {"analysis_id": "LOLTMNT03_179647"},
+        "confirmed_false": {"user_confirmed": False},
+        "confirmed_integer": {"user_confirmed": 1},
+        "source": {"context_source": "VERIFIED_EXTERNALLY"},
+        "verification": {"pre_draft_verification": "VERIFIED_EXTERNALLY"},
+        "mode": {"inference_mode": "REAL_RETROSPECTIVE_SIMULATION"},
+        "policy": {"policy_version": RETROSPECTIVE_PROTOCOL},
+        "hash": {"snapshot_sha256": "not-a-hash"},
+        "pool_duplicate": {"history_pool_game_ids": ("h1", "h1")},
+        "pool_order": {"history_pool_game_ids": ("h2", "h1")},
+        "pool_target": {"history_pool_game_ids": (context.analysis_id,)},
+        "pool_missing": {"history_pool_game_ids": None},
+        "future_cutoff": {"history_cutoff_at": context.pre_created_at + timedelta(days=1)},
+        "wrong_cutoff": {"history_cutoff_at": context.history_cutoff_at + timedelta(microseconds=1)},
+        "naive_created": {"pre_created_at": context.pre_created_at.replace(tzinfo=None)},
+        "future_ready": {"runtime_ready_at": context.pre_created_at + timedelta(seconds=1)},
+        "future_snapshot": {"snapshot_read_at": context.runtime_ready_at + timedelta(seconds=1)},
+        "future_availability": {"history_available_at": context.runtime_ready_at + timedelta(seconds=1)},
+        "planned_naive": {"planned_start_at": datetime(2025, 7, 3)},
+        "label": {"context_label": " "},
+    }
+    with pytest.raises(ModelInputError):
+        models.validate_runtime_context(replace(context, **changes[change]))
+
+
+@pytest.mark.parametrize("change", ["extra", "order", "feature_order", "config", "analysis_id",
+                                    "cutoff", "pool", "bad_team"])
+def test_interactive_prediction_validates_exact_schema_and_context(retrospective_fitted, change):
+    dataset, _split, bundle = retrospective_fitted
+    pre, _post, metadata, context = interactive_model_input(dataset)
+    analysis_id = context.analysis_id
+    if change == "extra":
+        metadata["target_ended_at"] = context.pre_created_at
+    elif change == "order":
+        metadata = metadata.loc[:, list(reversed(metadata.columns))]
+    elif change == "feature_order":
+        pre = pre.loc[:, list(reversed(pre.columns))]
+    elif change == "config":
+        metadata.at[analysis_id, "pre_config_version"] = "different"
+    elif change == "analysis_id":
+        metadata.at[analysis_id, "runtime_context"] = replace(context, analysis_id="analysis:other")
+    elif change == "cutoff":
+        metadata.at[analysis_id, "history_cutoff_at"] = context.history_cutoff_at + timedelta(hours=1)
+    elif change == "pool":
+        metadata.at[analysis_id, "history_game_ids"] = ("unapproved",)
+    else:
+        metadata.at[analysis_id, "red_team_id"] = metadata.at[analysis_id, "blue_team_id"]
+    with pytest.raises(PreFeatureInputError):
+        predict_phase(bundle, "PRE", pre, metadata, inference_policy=models.INTERACTIVE_INFERENCE_POLICY)
+
+
+def test_interactive_opt_in_does_not_relax_legacy_or_training_contracts(fitted, retrospective_fitted):
+    dataset, _split, bundle = retrospective_fitted
+    pre, post, metadata, _context = interactive_model_input(dataset)
+    with pytest.raises(ModelInputError):
+        predict_phase(bundle, "PRE", pre, metadata)
+    with pytest.raises(ModelInputError):
+        predict_phase(bundle, "PRE", pre, metadata, inference_policy="unknown")
+    with pytest.raises(ModelInputError):
+        predict_phase(fitted[2], "PRE", pre, metadata,
+                      inference_policy=models.INTERACTIVE_INFERENCE_POLICY)
+    legacy_metadata = dataset.metadata.iloc[[0]].loc[:, list(CONTEXT_COLUMNS)].copy(deep=True)
+    legacy_metadata.index = pre.index
+    legacy = predict_phase(bundle, "PRE", pre, legacy_metadata)[0]
+    assert legacy.context_signature == models._digest((pre.index[0], legacy_metadata.iloc[0].to_dict()))
+    interactive = predict_phase(bundle, "POST", post, metadata,
+                                inference_policy=models.INTERACTIVE_INFERENCE_POLICY)[0]
+    assert legacy.game_id == interactive.game_id
+    with pytest.raises(ModelInputError, match="E_EVAL_INCOMPATIBLE"):
+        compare_predictions(legacy, interactive)
+    with pytest.raises(PreFeatureInputError):
+        models.protocol_contract(models.INTERACTIVE_INFERENCE_POLICY)
+
+
+@pytest.mark.parametrize("field", ["pre_created_at", "context_label", "planned_start_at",
+                                   "snapshot_sha256", "history_pool_sha256"])
+def test_interactive_comparison_binds_runtime_assertions(retrospective_fitted, field):
+    dataset, _split, bundle = retrospective_fitted
+    pre, post, metadata, context = interactive_model_input(dataset)
+    kwargs = {"inference_policy": models.INTERACTIVE_INFERENCE_POLICY}
+    first = predict_phase(bundle, "PRE", pre, metadata, **kwargs)[0]
+    replacements = {
+        "pre_created_at": context.pre_created_at + timedelta(seconds=1),
+        "context_label": "Changed label",
+        "planned_start_at": context.pre_created_at + timedelta(days=1),
+        "snapshot_sha256": "d" * 64,
+        "history_pool_sha256": "e" * 64,
+    }
+    changed = metadata.copy(deep=True)
+    changed.at[context.analysis_id, "runtime_context"] = replace(context, **{field: replacements[field]})
+    second = predict_phase(bundle, "POST", post, changed, **kwargs)[0]
+    assert first.context_signature != second.context_signature
+    with pytest.raises(ModelInputError, match="E_EVAL_INCOMPATIBLE"):
+        compare_predictions(first, second)
