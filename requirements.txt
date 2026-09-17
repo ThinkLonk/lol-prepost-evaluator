@@ -1,9 +1,19 @@
-pandas
-scikit-learn
+# Nhom hoc may: khop voi metadata cua mo hinh hien tai
+numpy==2.5.2
+pandas==3.0.5
+scikit-learn==1.9.0
+scipy==1.18.1
+joblib==1.5.3
+
+# Giao dien va xu ly hinh anh
 streamlit
-joblib
-sqlalchemy
-psycopg
-alembic
+Pillow
 plotly
+
+# Co so du lieu va migration
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]
+alembic
+
+# Thu thap du lieu Leaguepedia
 mwrogue==0.1.5

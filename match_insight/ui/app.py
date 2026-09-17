@@ -96,11 +96,28 @@ def _reset_champion_choices():
             st.session_state[_widget_key(side, role)] = None
 
 
+def _retain_analysis_widgets():
+    # A transient early return omits these widgets. Detach their existing values
+    # from widget cleanup so a retry cannot silently change the saved context.
+    keys = [
+        "blue_team", "red_team", "analysis_patch", "analysis_context", "confirm_context",
+        "team_catalog_scope", "player_catalog_scope",
+    ]
+    for side in ("BLUE", "RED"):
+        for role in ROLES:
+            keys.extend((f"roster_{side}_{role}", _widget_key(side, role)))
+    for key in keys:
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+
+
 def _clear_context_result():
     _invalidate_stored()
     st.session_state["confirm_context"] = False
     st.session_state["evaluation_state"] = EvaluationState()
-    for key in ("stored_pre_id", "stored_post_id", "pending_pre", "pending_post"):
+    for key in (
+        "stored_pre_id", "stored_post_id", "pending_pre", "pending_post", "presentation_cache",
+    ):
         st.session_state.pop(key, None)
     _reset_champion_choices()
 
@@ -131,6 +148,9 @@ def _clear_stored_post():
     _invalidate_stored(post_only=True)
     st.session_state.pop("stored_post_id", None)
     st.session_state.pop("pending_post", None)
+    cache = st.session_state.get("presentation_cache", {})
+    for key in ("post_summary", "lineup", "comparison"):
+        cache.pop(key, None)
     state = st.session_state.get("evaluation_state")
     if isinstance(state, EvaluationState) and state.post is not None:
         st.session_state["evaluation_state"] = replace(state, post=None)
@@ -155,6 +175,41 @@ def _storage_ready():
     return False
 
 
+def _view_value(name, runtime, pre, build, *, post=None, choices=None):
+    """Session-only derived display data, tied to the exact retained snapshots.
+
+    Public service validation still runs for state refresh and every PRE/POST save.
+    This cache never supplies a substitute snapshot or authorizes an evaluation.
+    """
+    cache = st.session_state.setdefault("presentation_cache", {})
+    entry = cache.get(name)
+    if (
+        entry is not None and entry[0] is runtime and entry[1] is pre
+        and entry[2] is post and entry[3] == choices
+    ):
+        return entry[4]
+    value = build()
+    cache[name] = (runtime, pre, post, choices, value)
+    return value
+
+
+def _history_summary(runtime, pre, post=None):
+    return _view_value(
+        "pre_summary" if post is None else "post_summary", runtime, pre,
+        lambda: (
+            demo.analysis_history_summary(runtime, pre)
+            if post is None else _comparison(runtime, pre, post)["history_coverage"]
+        ), post=post,
+    )
+
+
+def _comparison(runtime, pre, post):
+    return _view_value(
+        "comparison", runtime, pre,
+        lambda: demo.compare_analysis_evaluations(runtime, pre, post), post=post,
+    )
+
+
 def _save_provenance(runtime, pre, post=None):
     target = pre.request.target
     player_ids = {slot.player_id for slot in target.blue_roster + target.red_roster}
@@ -171,7 +226,7 @@ def _save_provenance(runtime, pre, post=None):
             item.identity: item.name for item in runtime.catalog.champions
             if item.identity in champion_ids
         },
-        "history_coverage": demo.analysis_history_summary(runtime, pre, post),
+        "history_coverage": _history_summary(runtime, pre, post),
     }
 
 
@@ -334,8 +389,6 @@ def _show_saved_evaluation(record):
         st.warning(f"{warning['message']} [{warning['warning_code']}]")
     if "history_coverage" in provenance:
         _show_coverage(provenance["history_coverage"], names)
-    with st.expander("Dữ liệu và truy vết của bản lưu"):
-        st.json(record)
 
 
 def _saved_evaluations_view():
@@ -520,18 +573,6 @@ def _context_widgets(runtime, teams, players, coverage):
                             "trong phạm vi dữ liệu đang dùng."
                         )
 
-    with st.expander("Định danh đội và tuyển thủ đã chọn"):
-        st.caption("Mã phân biệt chỉ phục vụ hiển thị; bản ghi giữ nguyên stable ID.")
-        st.json({
-            "history_pool_sha256": coverage.history_pool_sha256,
-            "coverage_cutoff": coverage.history_cutoff_at.isoformat(),
-            "teams": selected,
-            "players": {
-                side: {slot.role: slot.player_id for slot in slots}
-                for side, slots in rosters.items()
-            },
-        })
-
     patch = st.text_input("Patch", key="analysis_patch", max_chars=20)
     label = st.text_input("Giải / bối cảnh ván (tùy chọn)", key="analysis_context")
     previous = st.session_state["analysis_input"]
@@ -605,16 +646,8 @@ def _show_pre(snapshot, names, summary):
         + ("." if pre.h2h_blue.win_count is None else f" · {pre.h2h_blue.win_count} thắng.")
     )
     _show_warnings(snapshot.warnings, names)
-    _show_coverage(summary, names)
-    context = snapshot.request.runtime_context
-    with st.expander("Thông tin truy vết PRE"):
-        st.caption(f"Phiên: {context.analysis_id}")
-        st.caption(f"Tạo PRE: {context.pre_created_at.isoformat()}")
-        st.caption(f"Cutoff đã khóa: {context.history_cutoff_at.isoformat()}")
-        st.caption(f"Lịch sử sẵn sàng trong runtime: {context.runtime_ready_at.isoformat()}")
-        st.caption(f"Chính sách inference: {context.policy_version}")
-        st.caption(f"Nguồn context: {context.context_source}")
-        st.caption(f"Xác minh trước cấm/chọn: {context.pre_draft_verification}")
+    if summary is not None:
+        _show_coverage(summary, names)
 
 
 def _champion_widgets(pre, players, champions):
@@ -687,45 +720,49 @@ def _show_comparison(comparison, target, names):
             "Đội": names[team_id], "Bên": side.upper(),
             "PRE": f"{comparison['pre'][f'{side}_win_probability']:.1%}",
             "POST": f"{comparison['post'][f'{side}_win_probability']:.1%}",
-            "Thay đổi (%)": (
+            "Thay đổi (điểm phần trăm)": (
                 f"{evaluation.percentage_points(comparison['comparison'][f'{side}_probability_delta']):+.1f}"
-                " %"
+                " điểm phần trăm"
             ),
         }
         for side, team_id in (("blue", target.blue_team_id), ("red", target.red_team_id))
     ], hide_index=True)
     st.caption("Xác suất ước lượng của mô hình thay đổi từ PRE sang POST.")
     _show_warnings(comparison["warnings"], names)
-    with st.expander("Thông tin truy vết so sánh"):
-        trace = {
-            key: comparison[key] for key in (
-                "analysis_id", "inference_mode", "inference_policy", "model",
-            ) if key in comparison
-        }
-        if "runtime_context" in comparison:
-            trace["runtime_context"] = {
-                key: value for key, value in comparison["runtime_context"].items()
-                if key != "history_pool_game_ids"
-            }
-        else:
-            trace.update({key: comparison[key] for key in (
-                "game_id", "history_cutoff_at", "data_kind", "evaluation_protocol",
-            ) if key in comparison})
-        st.json(trace)
 
 
-def _show_method(runtime):
-    with st.expander("Phương pháp và nguồn mô hình"):
-        st.write("Model được huấn luyện và đánh giá bằng benchmark hồi cứu.")
-        st.write(
-            "Context phiên này: USER_PROVIDED. Chưa xác minh thời điểm cung cấp context "
-            "trước cấm/chọn (NOT_VERIFIED)."
-        )
-        st.caption(f"Họ mô hình: {runtime.bundle.family}")
-        st.json({
-            "training_contract": asdict(runtime.bundle.contract),
-            "training_identity": asdict(runtime.bundle.identity),
-        })
+def _initialize_runtime():
+    """Automatically load once per session; failures require an explicit retry."""
+    previous_error = st.session_state.get("runtime_load_error")
+    retry_slot = st.empty()
+    retry = previous_error is not None and retry_slot.button("Thử nạp lại", key="retry_runtime")
+    runtime = None
+    if previous_error is None or retry:
+        # An interrupted attempt must not repeatedly open DB connections on rerun.
+        st.session_state["runtime_load_error"] = "Lần nạp trước chưa hoàn tất. Hãy thử nạp lại."
+        with st.spinner("Đang chuẩn bị dữ liệu và mô hình…"):
+            try:
+                runtime = demo.load_analysis_runtime()
+            except PreFeatureInputError as error:
+                st.session_state["runtime_load_error"] = _message(error)
+            except Exception:
+                st.session_state["runtime_load_error"] = (
+                    "Chưa nạp được dữ liệu và mô hình. Hãy kiểm tra kết nối rồi thử lại."
+                )
+        if runtime is not None:
+            retry_slot.empty()
+            st.session_state["demo_runtime"] = runtime
+            st.session_state["analysis_input"] = demo.AnalysisInput("", "", (), (), "", False)
+            st.session_state["roster_suggestions"] = {}
+            st.session_state["roster_teams"] = {}
+            for key in ("selection_coverage", "roster_coverage", "runtime_load_error"):
+                st.session_state.pop(key, None)
+            _clear_context_result()
+    if runtime is None:
+        st.error(st.session_state["runtime_load_error"])
+        if previous_error is None:
+            retry_slot.button("Thử nạp lại", key="retry_runtime")
+    return runtime
 
 
 def run():
@@ -750,11 +787,12 @@ def run():
         or not isinstance(st.session_state.get("analysis_input"), demo.AnalysisInput)
     ):
         # Streamlit can retain an old retrospective session when this page is upgraded.
-        # Require fresh explicit initialization, never relabel its old snapshots.
+        # Start a fresh interactive session, never relabel its old snapshots.
         for key in (
             "demo_runtime", "analysis_input", "roster_suggestions", "roster_teams",
             "target_game", "blue_team", "red_team", "analysis_patch", "analysis_context",
             "selection_coverage", "roster_coverage", "team_catalog_scope", "player_catalog_scope",
+            "runtime_load_error",
         ):
             st.session_state.pop(key, None)
         for side in ("BLUE", "RED"):
@@ -762,25 +800,17 @@ def run():
                 st.session_state.pop(f"roster_{side}_{role}", None)
         _clear_context_result()
         runtime = None
-        st.info("Phiên giao diện cũ không tương thích. Hãy nạp dữ liệu và mô hình cho phiên mới.")
+        st.info("Phiên giao diện cũ không tương thích. Đang chuẩn bị phiên phân tích mới.")
     if (
         runtime is not None and st.session_state["evaluation_state"].pre is not None
         and st.session_state.get("stored_pre_id") is None
     ):
         _clear_context_result()
         st.info("PRE của phiên trước chưa được lưu bền. Hãy xác nhận context và tạo PRE mới để lưu.")
-    if st.button("Nạp dữ liệu và mô hình", key="initialize_demo", disabled=runtime is not None):
-        runtime = _attempt(demo.load_analysis_runtime)
-        if runtime is not None:
-            st.session_state["demo_runtime"] = runtime
-            st.session_state["analysis_input"] = demo.AnalysisInput("", "", (), (), "", False)
-            st.session_state["roster_suggestions"] = {}
-            st.session_state["roster_teams"] = {}
-            st.session_state.pop("selection_coverage", None)
-            st.session_state.pop("roster_coverage", None)
-            _clear_context_result()
     if runtime is None:
-        st.caption("Nạp dữ liệu và mô hình trước khi chọn hai đội và xác nhận context.")
+        runtime = _initialize_runtime()
+    if runtime is None:
+        st.caption("Chưa thể phân tích khi dữ liệu và mô hình chưa sẵn sàng.")
         st.button("Tạo PRE", key="create_pre", disabled=True)
         st.button("Tạo POST", key="create_post", disabled=True)
         return
@@ -788,13 +818,16 @@ def run():
     teams = {item.identity: item for item in runtime.catalog.teams}
     names = {identity: item.name for identity, item in teams.items()}
     players = {item.identity: item for item in runtime.catalog.players}
-    _show_method(runtime)
     coverage = _attempt(lambda: demo.selection_coverage(
         runtime, pre=st.session_state["evaluation_state"].pre,
         previous=st.session_state.get("selection_coverage"),
     ))
     if coverage is None:
-        _clear_context_result()
+        # A temporary display/index failure must not invalidate a committed PRE.
+        # No analysis controls/results are rendered until coverage is available.
+        _retain_analysis_widgets()
+        if st.session_state["evaluation_state"].pre is None:
+            _clear_context_result()
         return
     st.session_state["selection_coverage"] = coverage
     selection, complete = _context_widgets(runtime, teams, players, coverage)
@@ -834,23 +867,25 @@ def run():
     if st.button(
         "Tạo PRE", key="create_pre", disabled=not selection.user_confirmed or state.pre is not None,
     ):
-        snapshot = _attempt(lambda: _persist_pre(runtime, selection))
-        if snapshot is not None:
-            st.session_state["selection_coverage"] = demo.selection_coverage(
-                runtime, pre=snapshot, previous=coverage,
-            )
-            _reset_champion_choices()
-            state = EvaluationState(context_key=snapshot.context_key, pre=snapshot)
-            st.session_state["evaluation_state"] = state
+        with st.spinner("Đang tính và lưu PRE…"):
+            snapshot = _attempt(lambda: _persist_pre(runtime, selection))
+            if snapshot is not None:
+                # Publish the committed PRE before optional display work. A coverage
+                # error must not lose its ID or cause a second inference/new cutoff.
+                _reset_champion_choices()
+                state = EvaluationState(context_key=snapshot.context_key, pre=snapshot)
+                st.session_state["evaluation_state"] = state
+                updated_coverage = _attempt(lambda: demo.selection_coverage(
+                    runtime, pre=snapshot, previous=coverage,
+                ))
+                if updated_coverage is not None:
+                    st.session_state["selection_coverage"] = updated_coverage
     if state.pre is None:
         st.caption("Xác nhận context và tạo PRE trước khi nhập đội hình tướng cuối cùng.")
         st.button("Tạo POST", key="create_post", disabled=True)
         return
 
-    summary = _attempt(lambda: demo.analysis_history_summary(runtime, state.pre))
-    if summary is None:
-        _clear_context_result()
-        return
+    summary = _attempt(lambda: _history_summary(runtime, state.pre))
     st.caption(f"Mã PRE đã lưu: {st.session_state['stored_pre_id']}")
     _show_pre(state.pre, names, summary)
     st.subheader("Đội hình cuối cùng — năm vị trí mỗi đội")
@@ -866,12 +901,18 @@ def run():
         st.session_state["evaluation_state"] = replace(state, post=None)
         return
     lineup = None
-    try:
-        lineup = demo.validate_analysis_lineup(runtime, state.pre, choices)
-    except PreFeatureInputError as error:
-        st.caption(_message(error))
-    except Exception:
-        st.caption("Chưa thể xác nhận đội hình. Hãy kiểm tra lại thông tin đã chọn.")
+    if all(value is not None for value in choices):
+        try:
+            lineup = _view_value(
+                "lineup", runtime, state.pre,
+                lambda: demo.validate_analysis_lineup(runtime, state.pre, choices), choices=choices,
+            )
+        except PreFeatureInputError as error:
+            st.caption(_message(error))
+        except Exception:
+            st.caption("Chưa thể xác nhận đội hình. Hãy kiểm tra lại thông tin đã chọn.")
+    else:
+        st.caption("Hãy chọn đủ 10 tướng cuối cùng.")
     if lineup is None:
         _clear_stored_post()
         state = replace(state, post=None)
@@ -880,11 +921,12 @@ def run():
         return
     st.session_state["evaluation_state"] = state
     if st.button("Tạo POST", key="create_post", disabled=lineup is None or state.post is not None):
-        snapshot = _attempt(lambda: _persist_post(runtime, state.pre, choices))
-        state = replace(state, post=snapshot)
-        st.session_state["evaluation_state"] = state
+        with st.spinner("Đang tính và lưu POST…"):
+            snapshot = _attempt(lambda: _persist_post(runtime, state.pre, choices))
+            state = replace(state, post=snapshot)
+            st.session_state["evaluation_state"] = state
     if state.post is not None:
-        comparison = _attempt(lambda: demo.compare_analysis_evaluations(runtime, state.pre, state.post))
+        comparison = _attempt(lambda: _comparison(runtime, state.pre, state.post))
         if comparison is None:
             _clear_stored_post()
             st.session_state["evaluation_state"] = replace(state, post=None)

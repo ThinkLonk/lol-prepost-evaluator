@@ -64,6 +64,11 @@ def main(argv=None):
     parser.add_argument("--approval-ref")
     parser.add_argument("--expected-dataset-id")
     parser.add_argument("--expected-split-id")
+    parser.add_argument(
+        "--output-directory",
+        type=Path,
+        help="Custom output directory for model artifacts",
+    )
     args = parser.parse_args(argv)
 
     protocol = args.evaluation_protocol
@@ -113,14 +118,19 @@ def main(argv=None):
                 approval_ref=args.approval_ref,
             )
         else:
+            execute_options = {
+                "train": args.mode == "train",
+                "expected_dataset_id": args.expected_dataset_id,
+                "expected_split_id": args.expected_split_id,
+                "evaluation_protocol": protocol,
+            }
+            if args.output_directory is not None:
+                execute_options["output_directory"] = args.output_directory
             report = execute_run(
                 snapshot,
                 evidence,
                 frozenset(args.approved_policy),
-                train=args.mode == "train",
-                expected_dataset_id=args.expected_dataset_id,
-                expected_split_id=args.expected_split_id,
-                evaluation_protocol=protocol,
+                **execute_options,
             )
     except PreFeatureInputError as error:
         status = (
