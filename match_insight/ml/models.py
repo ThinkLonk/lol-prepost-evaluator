@@ -11,7 +11,7 @@ import math
 import platform
 import re
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from io import BytesIO
@@ -301,12 +301,19 @@ def _plain(value):
     """Canonical serialization for fingerprints, including object-valued metadata."""
     if value is None or value is pd.NA:
         return None
+    # Most history leaves are built-in strings/integers. Avoid dataclass and ABC
+    # introspection for each leaf. Exact types preserve NumPy scalar normalization.
+    if type(value) in (str, int, bool):
+        return value
     if isinstance(value, np.generic):
         return _plain(value.item())
     if isinstance(value, datetime):
         return _utc(value).isoformat()
     if is_dataclass(value) and not isinstance(value, type):
-        return _plain(asdict(value))
+        # Recursively construct the same fresh JSON-compatible structure in one
+        # pass. asdict first deep-copied the entire history, then _plain traversed
+        # it again. Never cache/skip a digest: changed inputs must still be caught.
+        return {field.name: _plain(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, Mapping):
         return {str(key): _plain(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):

@@ -1,0 +1,12 @@
+/* Preserve direct PRE/POST comparison without horizontal scrolling on phones. */
+@media (max-width: 640px) {
+  .comparison-table { min-width: 0; }
+  .comparison-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .comparison-table tbody, .comparison-table tr { display: block; }
+  .comparison-table tr { display: grid; grid-template-columns: 1fr 1fr 1fr; padding: 14px 16px 18px; border-top: 1px solid var(--border); gap: 13px; }
+  .comparison-table tbody th:first-child { grid-column: 1 / -1; width: auto; border: 0; padding: 0; }
+  .comparison-table td, .comparison-table td:last-child { width: auto; border: 0; padding: 0; }
+  .comparison-table td::before { content: attr(data-label); display: block; margin-bottom: 7px; font-size: 10px; color: #a7b8d2; }
+  .comparison-table .probability>span, .comparison-table .delta { font-size: 21px; }
+  .comparison-table th small { margin-top: 2px; }
+}

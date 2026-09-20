@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# React UI HTTP adapter; does not change ML dependency versions.
+fastapi==0.141.1
+uvicorn==0.52.4

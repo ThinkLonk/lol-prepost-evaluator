@@ -2,7 +2,17 @@
 
 Hệ thống hỗ trợ khán giả so sánh xác suất thắng của hai đội trong một ván Liên Minh Huyền Thoại chuyên nghiệp trước và sau cấm/chọn.
 
-Tài liệu này hướng dẫn giảng viên cài đặt và chạy bản bàn giao trên Windows. Khi cài lần đầu, thực hiện mục 3, sau đó xem cách sử dụng ở mục 4. Mục 2 dùng cho những lần mở ứng dụng tiếp theo. Người chạy chỉ cần cài `requirements.txt`, không cần cài công cụ phát triển, chạy kiểm thử, thu thập dữ liệu hay huấn luyện lại mô hình.
+**Giao diện mới: React + TypeScript + FastAPI.** Xem [hướng dẫn cài đặt, chạy demo và kiến trúc](docs/React_FastAPI.md). Dùng chung dữ liệu PostgreSQL và ba mô hình đã huấn luyện; không cần thu thập dữ liệu hay huấn luyện lại khi chuyển giao diện.
+
+Chạy lệnh tại **thư mục gốc dự án**, nơi có file `README.md`:
+
+```powershell
+cd "C:\Đồ án ngành"
+.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-web.txt
+.\scripts\start_web.ps1
+```
+
+Thay đường dẫn ở lệnh `cd` nếu dự án nằm ở nơi khác. Mở **http://127.0.0.1:8000**; tài liệu API tại **http://127.0.0.1:8000/docs**. Script cài thư viện frontend bằng lockfile khi cần, build React và chạy FastAPI. Cần cấu hình dữ liệu và mô hình theo mục 3 trước khi phân tích.
 
 ## 1. Tóm tắt hệ thống
 
@@ -10,24 +20,40 @@ Tài liệu này hướng dẫn giảng viên cài đặt và chạy bản bàn 
 | --- | --- |
 | Đánh giá PRE | Ước lượng xác suất thắng từ bối cảnh ván đấu và lịch sử: phong độ, thành tích theo bên, đối đầu và mức độ liên tục đội hình. |
 | Đánh giá POST | Giữ nguyên thông tin nền của PRE, bổ sung đội hình mười tướng và lịch sử tuyển thủ–tướng để tính xác suất sau cấm/chọn. |
-| So sánh | Ba hàng Baseline, Logistic Regression và Random Forest; mỗi hàng có thanh PRE/POST chia BLUE–RED trên thang 0–100%, cùng thay đổi của hai đội theo **điểm phần trăm**. |
+| So sánh | Ba hàng Baseline, Logistic Regression và Random Forest; các cột PRE, POST và thay đổi theo **điểm phần trăm**. Chuyển tên đội để xem xác suất của bên tương ứng. |
 | Lưu và xem lại | Lưu đầu vào, kết quả và cảnh báo trong PostgreSQL; xem lại bằng mã đánh giá. |
 
-Ứng dụng sử dụng Python, pandas và scikit-learn để xử lý dữ liệu và chạy mô hình; PostgreSQL để lưu trữ; Streamlit và Plotly để xây dựng giao diện. Dữ liệu lịch sử đến từ Oracle’s Elixir; Data Dragon hỗ trợ danh mục và hình ảnh tướng. Giao diện hiển thị **Baseline, Logistic Regression và Random Forest** trên cùng đầu vào PRE/POST. Logistic Regression vẫn là mô hình canonical đã được chọn; hai bộ pipeline bổ sung dùng nguyên dữ liệu, split, seed và cách tiền xử lý của lần thực nghiệm đó. Giao diện chỉ nạp pipeline đã fit, không huấn luyện khi mở trang hoặc tạo đánh giá.
+Ứng dụng sử dụng Python, pandas và scikit-learn để xử lý dữ liệu và chạy mô hình; PostgreSQL để lưu trữ; React và FastAPI cho giao diện web mới. Bản Streamlit/Plotly vẫn có thể chạy để đối chiếu. Dữ liệu lịch sử đến từ Oracle’s Elixir; Data Dragon hỗ trợ danh mục và hình ảnh tướng. Giao diện hiển thị **Baseline, Logistic Regression và Random Forest** trên cùng đầu vào PRE/POST. Logistic Regression vẫn là mô hình canonical đã được chọn; hai bộ pipeline bổ sung dùng nguyên dữ liệu, split, seed và cách tiền xử lý của lần thực nghiệm đó. Giao diện chỉ nạp pipeline đã fit, không huấn luyện khi mở trang hoặc tạo đánh giá.
 
 Người dùng cung cấp thông tin ván đấu và đội hình cuối cùng. Ứng dụng không tự lấy diễn biến cấm/chọn trực tiếp, không cập nhật xác suất trong ván và không đưa ra khuyến nghị cá cược hoặc chọn tướng. Chênh lệch PRE–POST là thay đổi dự báo của mô hình, không chứng minh tác động nhân quả của đội hình.
 
-## 2. Chạy nhanh trên máy đã cài đặt
+## 2. Khởi động và cập nhật giao diện
 
-Áp dụng khi đã có môi trường `.venv`, file `.env`, cơ sở dữ liệu và bộ mô hình tương thích. Mở PowerShell tại thư mục chứa `README.md` và `streamlit_app.py`, sau đó chạy:
+Khi đã có `.venv`, `.env`, PostgreSQL, mô hình và bản build React:
+
+```powershell
+.\scripts\start_web.ps1 -SkipBuild
+```
+
+Giữ terminal mở khi sử dụng; nhấn **Ctrl+C** để dừng. Sau khi sửa mã frontend hoặc lấy mã mới từ Git, cần build lại:
+
+```powershell
+npm.cmd --prefix frontend ci
+npm.cmd --prefix frontend run build
+.\scripts\start_web.ps1 -SkipBuild
+```
+
+Nếu máy chủ đang chạy, chỉ cần hai lệnh npm rồi tải lại trình duyệt bằng **Ctrl+F5** để nhận bản giao diện mới. Nếu mã Python thay đổi, dừng và khởi động lại máy chủ.
+
+Mô hình và lịch sử được nạp một lần mỗi tiến trình. Ứng dụng chạy một worker; khởi động lại máy chủ làm mất phiên phân tích trong RAM, nhưng bản đánh giá đã lưu trong PostgreSQL vẫn tra cứu được bằng mã.
+
+Bản Streamlit cũ vẫn có thể chạy riêng để đối chiếu:
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -B -m streamlit run streamlit_app.py
 ```
 
-Mở địa chỉ được hiển thị trong terminal, mặc định là **http://localhost:8501**. Giữ terminal hoạt động trong khi sử dụng; nhấn **Ctrl+C** để dừng ứng dụng.
-
-Mỗi phiên giao diện nạp dữ liệu và mô hình khi khởi tạo. Người dùng không cần chạy lại ETL hoặc huấn luyện mô hình trước mỗi lần sử dụng.
+Địa chỉ mặc định của bản Streamlit là `http://localhost:8501`.
 
 ## 3. Cài đặt trên máy mới
 
@@ -35,9 +61,9 @@ Giải nén bản bàn giao vào thư mục trên máy, mở **Windows PowerShel
 
 Bản bàn giao cần có mã nguồn, mô hình đã huấn luyện, các file dữ liệu đi kèm và bản sao PostgreSQL được liệt kê ở mục 3.4. Nếu thiếu thành phần nào, cần yêu cầu sinh viên cung cấp bổ sung trước khi chạy.
 
-### 3.1. Chuẩn bị Python và PostgreSQL
+### 3.1. Chuẩn bị Python, Node.js và PostgreSQL
 
-Cần Python, PostgreSQL đang hoạt động và tài khoản có quyền đọc dữ liệu, lưu đánh giá. Nếu phục hồi dữ liệu bằng dòng lệnh, cần thêm các công cụ PostgreSQL `psql` và `pg_restore` trong `PATH`; cũng có thể dùng pgAdmin để tạo cơ sở dữ liệu và phục hồi bản sao.
+Cần Node.js và npm để cài/build frontend (môi trường đã chạy thử dùng Node.js 24), Python, PostgreSQL đang hoạt động và tài khoản có quyền đọc dữ liệu, lưu đánh giá. Nếu phục hồi dữ liệu bằng dòng lệnh, cần thêm các công cụ PostgreSQL `psql` và `pg_restore` trong `PATH`; cũng có thể dùng pgAdmin để tạo cơ sở dữ liệu và phục hồi bản sao.
 
 Bộ nạp mô hình kiểm tra chính xác sáu phiên bản dưới đây, lấy từ `artifacts/models/retrospective_pre_post.json`:
 
@@ -79,13 +105,13 @@ Kết quả Python cần là `3.12.14`; lệnh cuối cần hiển thị phiên 
 Cài các thư viện chạy ứng dụng và kiểm tra phụ thuộc:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-web.txt
 .\.venv\Scripts\python.exe -m pip check
 ```
 
 Kết quả mong đợi của lệnh kiểm tra là `No broken requirements found.` Đây là kiểm tra phụ thuộc thư viện; cần hoàn thành cấu hình dữ liệu và mở ứng dụng ở các bước tiếp theo để kiểm tra bản bàn giao.
 
-`requirements.txt` đã cố định phiên bản NumPy, pandas, scikit-learn, SciPy và joblib theo metadata của mô hình, đồng thời khai báo Pillow và `psycopg[binary]`. File này không cài hoặc thay đổi phiên bản Python; môi trường `.venv` vẫn cần dùng Python 3.12.14.
+`requirements-web.txt` cài FastAPI, Uvicorn và bao gồm `requirements.txt`. File `requirements.txt` đã cố định phiên bản NumPy, pandas, scikit-learn, SciPy và joblib theo metadata của mô hình, đồng thời khai báo Pillow và `psycopg[binary]`. File này không cài hoặc thay đổi phiên bản Python; môi trường `.venv` vẫn cần dùng Python 3.12.14.
 
 `requirements-dev.txt` dành cho việc phát triển mã nguồn, không cần dùng để cài bản chạy chấm bài.
 
@@ -156,15 +182,15 @@ Lệnh sau chỉ thử kết nối và chạy `SELECT 1`, không ghi dữ liệu
 .\.venv\Scripts\python.exe -c "from match_insight.database.engine import check_database_connection; print(check_database_connection())"
 ```
 
-Kết quả mong đợi là `1`. Sau đó chạy lệnh Streamlit ở mục 2. Khi nạp thành công, trang **Phân tích ván đấu** hiển thị danh sách đội và tuyển thủ để thiết lập đầu vào. Lần nạp đầu cần đọc lịch sử và mô hình nên có thể lâu hơn các thao tác tiếp theo.
+Kết quả mong đợi là `1`. Sau đó chạy `.\scripts\start_web.ps1` để build và mở bản React + FastAPI. Khi nạp thành công, trang **Phân tích ván đấu** hiển thị danh sách đội và tuyển thủ để thiết lập đầu vào. Lần nạp đầu cần đọc lịch sử và mô hình nên có thể lâu hơn các thao tác tiếp theo.
 
-## 4. Cách sử dụng
+## 4. Luồng demo trên giao diện React
 
 ### Bước 1. Thiết lập thông tin ván đấu
 
-1. Chọn hai đội khác nhau ở bên `BLUE` và `RED`.
-2. Kiểm tra năm tuyển thủ mỗi đội theo các vị trí Đường trên, Đi rừng, Đường giữa, Xạ thủ và Hỗ trợ. Gợi ý được lấy từ lịch sử, nên cần sửa lại nếu đội hình thực tế khác.
-3. Nếu không thấy đội hoặc tuyển thủ cần chọn, chuyển phạm vi từ **Có lịch sử đã liên kết** sang **Toàn bộ danh mục**. Bản ghi trong danh mục vẫn có thể chưa có lịch sử liên kết.
+1. Chọn hai đội khác nhau ở bên xanh và bên đỏ. Có thể gõ tắt: `HLE` → Hanwha Life Esports; `Gen`, `geng` → Gen.G. Tìm kiếm không phân biệt hoa/thường và bỏ qua dấu câu, khoảng trắng.
+2. Ảnh tuyển thủ hiển thị cạnh ô chọn; thiếu ảnh sẽ có chữ viết tắt thay thế. Kiểm tra năm tuyển thủ mỗi đội theo các vị trí Đường trên, Đi rừng, Đường giữa, Xạ thủ và Hỗ trợ. Gợi ý được lấy từ lịch sử, nên cần sửa lại nếu đội hình thực tế khác.
+3. Nếu không thấy đội hoặc tuyển thủ cần chọn, bỏ chọn **Chỉ hiện tên có lịch sử**. Bản ghi trong danh mục vẫn có thể chưa có lịch sử liên kết.
 4. Nhập **Patch**. Ô **Giải / bối cảnh ván (tùy chọn)** dùng để ghi thêm thông tin ván đấu.
 5. Đánh dấu ô xác nhận hai đội, bên thi đấu, patch và tuyển thủ/vị trí do người dùng cung cấp.
 
@@ -172,31 +198,31 @@ Cần đủ mười tuyển thủ khác nhau, mỗi người ở một vị trí
 
 ### Bước 2. Tạo và xem PRE
 
-Nhấn **Tạo PRE**. Hệ thống tổng hợp lịch sử hợp lệ, tính xác suất và lưu bản đánh giá. Mỗi mô hình có một thanh PRE chia hai phần BLUE/RED, kèm tên đội và phần trăm bằng chữ; các thống kê lịch sử, số mẫu và cảnh báo dùng chung nằm bên dưới. Ghi lại **Mã PRE đã lưu** nếu muốn tra cứu sau.
+Nhấn **Tạo đánh giá PRE**. Hệ thống tổng hợp lịch sử hợp lệ, tính xác suất và lưu bản đánh giá. Bảng hiển thị xác suất PRE của ba mô hình theo đội đang được chọn; các thống kê lịch sử, số mẫu và cảnh báo dùng chung nằm bên dưới. Mở **Thông tin bản lưu và thời gian xử lý** để ghi lại mã PRE nếu muốn tra cứu sau.
 
 Mốc giới hạn lịch sử trong phiên tương tác được tính tại lúc tạo PRE: **00:00 UTC của ngày liền trước ngày tạo PRE theo UTC**. POST giữ nguyên mốc và thông tin nền này. Mốc trên là quy tắc lọc lịch sử, không phải thời điểm bắt đầu cấm/chọn được lấy trực tiếp từ giải đấu.
 
 ### Bước 3. Nhập đội hình cuối cùng và tạo POST
 
-Sau khi cấm/chọn hoàn tất, chọn tướng cho từng tuyển thủ ở đủ mười vị trí. Danh sách phải có mười tướng hợp lệ và không trùng nhau. Nhấn **Tạo POST** để tính và lưu đánh giá sau cấm/chọn.
+Sau khi cấm/chọn hoàn tất, chọn tướng cho từng tuyển thủ ở đủ mười vị trí. Danh sách phải có mười tướng hợp lệ và không trùng nhau. Nhấn **Tạo POST & so sánh** để tính và lưu đánh giá sau cấm/chọn.
 
-Kết quả POST hiển thị xác suất mới, lịch sử tuyển thủ–tướng và cảnh báo. Một cặp chưa có lịch sử được ghi **Chưa ghi nhận**, không tự xem là tỷ lệ thắng 0% hoặc 50%. Lưu lại **Mã POST đã lưu** khi cần xem lại.
+Kết quả POST hiển thị xác suất mới, lịch sử tuyển thủ–tướng và cảnh báo. Một cặp chưa có lịch sử được ghi **Chưa ghi nhận**, không tự xem là tỷ lệ thắng 0% hoặc 50%. Cảnh báo thiếu lịch sử liệt kê ngay tên **tuyển thủ — tướng**, đội và vị trí của từng cặp chưa ghi nhận. Mở **Thông tin bản lưu và thời gian xử lý** để lấy mã POST khi cần xem lại.
 
 ### Bước 4. Xem so sánh và xử lý khi đổi đầu vào
 
-Sau POST, mỗi hàng mô hình có hai thanh PRE và POST trên cùng thang 0–100%, kèm thay đổi có dấu của cả hai đội. Ví dụ cách đọc: từ 54% lên 58% là **tăng 4 điểm phần trăm**. Đây chỉ là ví dụ giải thích đơn vị, không phải kết quả thực nghiệm. Baseline dùng tỷ lệ thắng BLUE học từ tập train nên PRE và POST có thể bằng nhau. Xác suất cao hơn ở một ván không chứng minh mô hình tốt hơn; Brier Score, Log Loss, ROC-AUC và calibration cần được đối chiếu riêng trên cùng tập đánh giá.
+Sau POST, mỗi hàng mô hình có xác suất PRE, POST và thay đổi có dấu của đội đang chọn. Nhấn tên đội còn lại để đổi hướng xem. Ví dụ cách đọc: từ 54% lên 58% là **tăng 4 điểm phần trăm**. Đây chỉ là ví dụ giải thích đơn vị, không phải kết quả thực nghiệm. Baseline dùng tỷ lệ thắng BLUE học từ tập train nên PRE và POST có thể bằng nhau. Xác suất cao hơn ở một ván không chứng minh mô hình tốt hơn; Brier Score, Log Loss, ROC-AUC và calibration cần được đối chiếu riêng trên cùng tập đánh giá.
 
 | Thao tác thay đổi | Cách tiếp tục |
 | --- | --- |
-| Chỉ đổi tướng | PRE được giữ; cần tạo POST mới. |
-| Đổi đội, bên thi đấu, tuyển thủ, vị trí, patch hoặc bối cảnh | Xác nhận lại đầu vào và tạo PRE mới trước khi tạo POST. |
+| Chỉ đổi tướng | Nhấn **Chỉnh sửa đội hình**; PRE được giữ, POST cũ mất hiệu lực; chọn lại rồi tạo POST mới. |
+| Đổi đội, bên thi đấu, tuyển thủ, vị trí, patch hoặc bối cảnh | Nhấn **Chỉnh sửa bối cảnh**, xác nhận lại đầu vào và tạo PRE mới trước khi tạo POST. |
 | Lưu kết quả bị lỗi | Kiểm tra kết nối/quyền ghi rồi thử lại thao tác. Kết quả chỉ được công bố sau khi lưu thành công. |
 
 Số mẫu ít là hạn chế của dữ liệu, không phải bằng chứng tuyển thủ hoặc đội yếu. Cần đọc số mẫu và cảnh báo cùng với xác suất.
 
 ### Bước 5. Xem lại đánh giá đã lưu
 
-Mở **Xem đánh giá đã lưu**, nhập mã vào ô **Mã đánh giá đã lưu** rồi nhấn **Đọc bản lưu**. Mã đánh giá là số được cấp sau khi lưu thành công.
+Mở **Bản đã lưu**, nhập **Mã đánh giá** rồi nhấn **Tra cứu bản lưu**. Mã đánh giá là số được cấp sau khi lưu thành công.
 
 Phần này chỉ hiển thị lại đầu vào, kết quả, cảnh báo và trạng thái bản lưu; không khôi phục phiên để tiếp tục tạo POST. Để phân tích lại, thiết lập đầu vào trong phiên hiện tại. Kết quả ba mô hình và identity từng bộ pipeline được lưu chung trong `input_snapshot.provenance.model_comparison` của đánh giá canonical, cùng transaction. Bản lưu cũ chỉ có một mô hình vẫn được đọc nguyên trạng; ứng dụng không tính thêm hoặc ghi đè dự đoán cũ.
 
@@ -204,26 +230,33 @@ Phần này chỉ hiển thị lại đầu vào, kết quả, cảnh báo và t
 
 | Hiện tượng | Kiểm tra và xử lý |
 | --- | --- |
-| `No module named pip` | Chạy `.\.venv\Scripts\python.exe -m ensurepip --upgrade`, sau đó thực hiện lại bước cài `requirements.txt` ở mục 3.2. Kích hoạt `.venv` không tự cài pip. |
+| `No module named pip` | Chạy `.\.venv\Scripts\python.exe -m ensurepip --upgrade`, sau đó thực hiện lại bước cài `requirements-web.txt` ở mục 3.2. Kích hoạt `.venv` không tự cài pip. |
 | `No module named ensurepip` | Bản Python đang dùng thiếu thành phần tạo pip. Cần bản Python đầy đủ đúng phiên bản ở mục 3.1 rồi tạo môi trường riêng trên máy. |
 | `No matching distribution found` khi cài thư viện | Gửi lỗi cho sinh viên để kiểm tra bản Python, kho gói và bộ môi trường bàn giao. Không tự sửa các phiên bản đã cố định. |
 | Thiếu `DATABASE_URL` hoặc không kết nối được | Kiểm tra `.env`, tài khoản, tên database, cổng và dịch vụ PostgreSQL; chú ý biến môi trường có thể ghi đè `.env`. |
 | Chưa có đủ tệp model / không nạp được model | Kiểm tra cặp `.joblib` và `.json` trong `artifacts/models/`, manifest cùng hai `.joblib` trong `artifacts/models_comparison/`, và file `retrospective_pre_inputs.json`. Không thay mô hình bằng số dự đoán giả. |
 | Model không tương thích với môi trường | Đối chiếu đủ sáu phiên bản ở mục 3.1, bao gồm phiên bản vá của Python. |
 | Dữ liệu hoặc file đầu vào không khớp bản đã duyệt | Dùng đúng bộ PostgreSQL, hồ sơ thời gian và mô hình được bàn giao cùng nhau. Không bỏ qua kiểm tra mã băm. |
-| Lần nạp dữ liệu chưa hoàn tất | Khắc phục nguyên nhân rồi nhấn **Thử nạp lại**. |
+| Lần nạp dữ liệu chưa hoàn tất | Khắc phục nguyên nhân rồi tải lại trang. |
 | Nút PRE bị khóa | Kiểm tra hai đội khác nhau, đủ mười tuyển thủ khác nhau, patch và ô xác nhận đầu vào. |
 | Nút POST bị khóa | Tạo PRE thành công, chọn đủ mười tướng khác nhau; nếu POST đã tồn tại và đầu vào không đổi thì không cần tạo lại. |
-| Chưa thể cập nhật trạng thái bản lưu | Khôi phục kết nối/quyền ghi và nhấn **Thử đồng bộ trạng thái bản lưu**. |
+| Chưa thể cập nhật trạng thái bản lưu | Khôi phục kết nối/quyền ghi rồi thử lại thao tác chỉnh sửa. |
 | Không đọc được đánh giá đã lưu | Kiểm tra mã số và cơ sở dữ liệu đang kết nối; bản ghi có thể nằm ở database khác. |
 | Không có ảnh đội, tuyển thủ hoặc tướng | Kiểm tra file trong `assets/` và đường dẫn media đã lưu. Thiếu ảnh không ngăn tạo PRE/POST. |
-| Cổng 8501 đang được sử dụng | Dừng ứng dụng cũ hoặc chạy với `--server.port 8502`, rồi mở địa chỉ mới. |
+| Không tìm thấy `start_web.ps1` | Chuyển vào thư mục gốc dự án bằng `cd` trước khi chạy. Dấu nhắc `(.venv)` không có nghĩa đang đứng đúng thư mục. |
+| `Unexpected token`, tiếng Việt thành `ChÆ...` trong script | Dùng bản script mới; thông báo trong script đã chuyển sang ASCII để tương thích Windows PowerShell 5.1. |
+| Giao diện chưa có thay đổi mới | Build lại frontend rồi nhấn **Ctrl+F5**. `-SkipBuild` chỉ dùng bản build đã tồn tại. |
+| Cổng 8000 đang được sử dụng | Nếu ứng dụng đã chạy, mở địa chỉ hiện có; hoặc dùng `.\scripts\start_web.ps1 -SkipBuild -Port 8001` rồi mở `http://127.0.0.1:8001`. |
 
 ## 6. Các thư mục chính
 
 | Đường dẫn | Vai trò |
 | --- | --- |
-| `streamlit_app.py` | Điểm khởi động Streamlit. |
+| `frontend/src/` | Giao diện React + TypeScript, ô tìm kiếm, ảnh và bảng so sánh. |
+| `match_insight/api/` | FastAPI, phiên phân tích, tài nguyên dùng chung và phục vụ ảnh. |
+| `scripts/start_web.ps1` | Build frontend và khởi động ứng dụng web. |
+| `docs/React_FastAPI.md` | Hướng dẫn kiến trúc, phát triển và vận hành web. |
+| `streamlit_app.py` | Điểm khởi động bản Streamlit cũ. |
 | `match_insight/ui/` | Nhập thông tin và trình bày kết quả. |
 | `match_insight/services/` | Điều phối PRE, POST, so sánh và lưu đánh giá. |
 | `match_insight/features/` | Tổng hợp đặc trưng và lọc lịch sử. |
@@ -236,3 +269,30 @@ Phần này chỉ hiển thị lại đầu vào, kết quả, cảnh báo và t
 | `reports/` | Báo cáo kiểm tra dữ liệu và thực nghiệm đã lưu. |
 
 Các script như `apply_oracle_etl.py`, `apply_oracle_riot_v5_backfill.py` và `train_real_models.py` phục vụ chuẩn bị dữ liệu hoặc thực nghiệm, không phải các bước khởi động giao diện. Nếu cần xây lại bộ dữ liệu/mô hình, đọc tham số và điều kiện đầu vào của từng script; các bước này có thể ghi database hoặc tạo file mới. Hướng dẫn trên tập trung chạy và sử dụng bộ hệ thống đã được chuẩn bị.
+
+## 7. Kiểm tra mã nguồn
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -X utf8 -m pytest
+npm.cmd --prefix frontend run build
+```
+
+Xem [biên bản kiểm chứng React + FastAPI](reports/authored/react_fastapi_acceptance.md) để đọc phạm vi kiểm tra, số đo tốc độ và giới hạn của phép đo.
+
+## 8. Đưa thay đổi lên GitHub
+
+Tại thư mục gốc, kiểm tra nhánh và danh sách thay đổi trước khi commit:
+
+```powershell
+git branch --show-current
+git status --short
+git add .
+git diff --cached --stat
+git commit -m "Update React FastAPI UI and setup guide"
+git push origin main
+```
+
+Lệnh cuối áp dụng khi đang ở nhánh `main` của repository này; nếu làm việc ở nhánh khác, dùng tên nhánh đó. Nếu push bị từ chối vì remote có commit mới, chạy `git pull --rebase origin main`, giải quyết xung đột nếu có rồi push lại; không dùng force push để ghi đè lịch sử.
+
+`.gitignore` loại `.env`, `.venv`, `node_modules`, bản build frontend, mô hình `.joblib` và ảnh đội/tuyển thủ tải về khỏi commit. File `frontend/package-lock.json` được đưa lên Git để tái tạo phụ thuộc. Clone repository chưa đủ để chạy dự đoán: cần nhận riêng bộ dữ liệu, mô hình và ảnh theo mục 3.4.

@@ -54,3 +54,9 @@ artifacts/models/*
 /assets/**/*.part
 tmp/
 ~$*
+
+# React build and package cache
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
