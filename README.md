@@ -279,20 +279,3 @@ npm.cmd --prefix frontend run build
 ```
 
 Xem [biên bản kiểm chứng React + FastAPI](reports/authored/react_fastapi_acceptance.md) để đọc phạm vi kiểm tra, số đo tốc độ và giới hạn của phép đo.
-
-## 8. Đưa thay đổi lên GitHub
-
-Tại thư mục gốc, kiểm tra nhánh và danh sách thay đổi trước khi commit:
-
-```powershell
-git branch --show-current
-git status --short
-git add .
-git diff --cached --stat
-git commit -m "Update React FastAPI UI and setup guide"
-git push origin main
-```
-
-Lệnh cuối áp dụng khi đang ở nhánh `main` của repository này; nếu làm việc ở nhánh khác, dùng tên nhánh đó. Nếu push bị từ chối vì remote có commit mới, chạy `git pull --rebase origin main`, giải quyết xung đột nếu có rồi push lại; không dùng force push để ghi đè lịch sử.
-
-`.gitignore` loại `.env`, `.venv`, `node_modules`, bản build frontend, mô hình `.joblib` và ảnh đội/tuyển thủ tải về khỏi commit. File `frontend/package-lock.json` được đưa lên Git để tái tạo phụ thuộc. Clone repository chưa đủ để chạy dự đoán: cần nhận riêng bộ dữ liệu, mô hình và ảnh theo mục 3.4.
