@@ -926,7 +926,38 @@ def fit_model_bundle(
     Test features/labels are not passed to fit, preprocessing transform,
     metric evaluation or choose_family.
     """
+    candidates = fit_model_candidates(
+        dataset, split, identity, config, policy, evaluation_protocol=evaluation_protocol,
+    )
+    family = choose_family(candidates[0].validation_scores, policy)
+    return next(bundle for bundle in candidates if bundle.family == family)
+
+
+def fit_model_candidates(
+    dataset: PairedDataset,
+    split: TemporalSplit,
+    identity: ModelIdentity,
+    config: ModelConfig = ModelConfig(),
+    policy: SelectionPolicy = SelectionPolicy(),
+    *,
+    evaluation_protocol: str = STRICT_PROTOCOL,
+    candidate_identities=None,
+):
+    """Retain the existing three training recipes without selecting or evaluating test.
+
+    The original selected-bundle API delegates here with its unchanged identity.
+    An explicit offline comparison run may give each candidate its own version.
+    """
     _validate_options(identity, config, policy)
+    identities = dict.fromkeys(FAMILIES, identity)
+    if candidate_identities is not None:
+        if not isinstance(candidate_identities, Mapping) or set(candidate_identities) != set(FAMILIES):
+            _fail("E_MODEL_IDENTITY_INVALID", "Require an identity for each model family")
+        identities = dict(candidate_identities)
+        for candidate in identities.values():
+            _validate_options(candidate, config, policy)
+            if (candidate.dataset_id, candidate.split_id) != (identity.dataset_id, identity.split_id):
+                _fail("E_MODEL_IDENTITY_INVALID", "Candidates must retain the same dataset and split")
     pre, post, metadata, contract = _prepare_dataset(
         dataset, evaluation_protocol=evaluation_protocol
     )
@@ -960,8 +991,6 @@ def fit_model_bundle(
         scores.append(ValidationScore(family, pre_metrics, post_metrics))
 
     scores = tuple(scores)
-    family = choose_family(scores, policy)
-    pre_pipeline, post_pipeline = candidates[family]
     train_signature = _digest(
         (
             pre.loc[train_ids].to_dict("split"),
@@ -970,22 +999,29 @@ def fit_model_bundle(
             metadata.loc[train_ids].to_dict("split"),
         )
     )
-    return ModelBundle(
-        identity=identity,
-        family=family,
-        pre_pipeline=pre_pipeline,
-        post_pipeline=post_pipeline,
-        config=config,
-        selection_policy=policy,
-        validation_scores=scores,
-        contract=contract,
-        split=split,
-        dataset_signature=_dataset_signature(dataset),
-        fit_signature=_digest((identity, family, config, policy, contract, train_signature)),
-        estimator_parameters=tuple(
-            sorted(pre_pipeline.named_steps["model"].get_params(deep=False).items())
-        ),
-        library_versions=_versions(),
+    dataset_signature = _dataset_signature(dataset)
+    libraries = _versions()
+    return tuple(
+        ModelBundle(
+            identity=identities[family],
+            family=family,
+            pre_pipeline=pre_pipeline,
+            post_pipeline=post_pipeline,
+            config=config,
+            selection_policy=policy,
+            validation_scores=scores,
+            contract=contract,
+            split=split,
+            dataset_signature=dataset_signature,
+            fit_signature=_digest(
+                (identities[family], family, config, policy, contract, train_signature)
+            ),
+            estimator_parameters=tuple(
+                sorted(pre_pipeline.named_steps["model"].get_params(deep=False).items())
+            ),
+            library_versions=libraries,
+        )
+        for family, (pre_pipeline, post_pipeline) in candidates.items()
     )
 
 

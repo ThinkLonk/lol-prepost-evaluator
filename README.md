@@ -10,10 +10,10 @@ Tài liệu này hướng dẫn giảng viên cài đặt và chạy bản bàn 
 | --- | --- |
 | Đánh giá PRE | Ước lượng xác suất thắng từ bối cảnh ván đấu và lịch sử: phong độ, thành tích theo bên, đối đầu và mức độ liên tục đội hình. |
 | Đánh giá POST | Giữ nguyên thông tin nền của PRE, bổ sung đội hình mười tướng và lịch sử tuyển thủ–tướng để tính xác suất sau cấm/chọn. |
-| So sánh | Hiển thị PRE, POST và mức thay đổi xác suất của đội bên Xanh theo **điểm phần trăm**. |
+| So sánh | Ba hàng Baseline, Logistic Regression và Random Forest; mỗi hàng có thanh PRE/POST chia BLUE–RED trên thang 0–100%, cùng thay đổi của hai đội theo **điểm phần trăm**. |
 | Lưu và xem lại | Lưu đầu vào, kết quả và cảnh báo trong PostgreSQL; xem lại bằng mã đánh giá. |
 
-Ứng dụng sử dụng Python, pandas và scikit-learn để xử lý dữ liệu và chạy mô hình; PostgreSQL để lưu trữ; Streamlit để xây dựng giao diện. Dữ liệu lịch sử đến từ Oracle’s Elixir; Data Dragon hỗ trợ danh mục và hình ảnh tướng. Ba mô hình được thực nghiệm là Baseline, Logistic Regression và Random Forest. Bộ mô hình đi kèm hiện dùng **Logistic Regression** cho hai cấu hình PRE và POST.
+Ứng dụng sử dụng Python, pandas và scikit-learn để xử lý dữ liệu và chạy mô hình; PostgreSQL để lưu trữ; Streamlit và Plotly để xây dựng giao diện. Dữ liệu lịch sử đến từ Oracle’s Elixir; Data Dragon hỗ trợ danh mục và hình ảnh tướng. Giao diện hiển thị **Baseline, Logistic Regression và Random Forest** trên cùng đầu vào PRE/POST. Logistic Regression vẫn là mô hình canonical đã được chọn; hai bộ pipeline bổ sung dùng nguyên dữ liệu, split, seed và cách tiền xử lý của lần thực nghiệm đó. Giao diện chỉ nạp pipeline đã fit, không huấn luyện khi mở trang hoặc tạo đánh giá.
 
 Người dùng cung cấp thông tin ván đấu và đội hình cuối cùng. Ứng dụng không tự lấy diễn biến cấm/chọn trực tiếp, không cập nhật xác suất trong ván và không đưa ra khuyến nghị cá cược hoặc chọn tướng. Chênh lệch PRE–POST là thay đổi dự báo của mô hình, không chứng minh tác động nhân quả của đội hình.
 
@@ -22,7 +22,7 @@ Người dùng cung cấp thông tin ván đấu và đội hình cuối cùng. 
 Áp dụng khi đã có môi trường `.venv`, file `.env`, cơ sở dữ liệu và bộ mô hình tương thích. Mở PowerShell tại thư mục chứa `README.md` và `streamlit_app.py`, sau đó chạy:
 
 ```powershell
-.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py
+.\.venv\Scripts\python.exe -X utf8 -B -m streamlit run streamlit_app.py
 ```
 
 Mở địa chỉ được hiển thị trong terminal, mặc định là **http://localhost:8501**. Giữ terminal hoạt động trong khi sử dụng; nhấn **Ctrl+C** để dừng ứng dụng.
@@ -120,6 +120,9 @@ Thay `user`, `password`, địa chỉ máy chủ, cổng và tên cơ sở dữ 
 | Dữ liệu PostgreSQL | Lịch sử ván đấu, danh mục đội/tuyển thủ/tướng, thông tin thời gian và các bảng lưu đánh giá. Dữ liệu lịch sử phải khớp bộ đầu vào đã cố định. |
 | Mô hình đã huấn luyện | `artifacts/models/retrospective_pre_post.joblib` |
 | Metadata mô hình | `artifacts/models/retrospective_pre_post.json` |
+| Manifest bộ ba mô hình | `artifacts/models_comparison/manifest.json` |
+| Pipeline Baseline bổ sung | `artifacts/models_comparison/baseline_pre_post.joblib` |
+| Pipeline Random Forest bổ sung | `artifacts/models_comparison/random_forest_pre_post.joblib` |
 | Hồ sơ thời gian và đầu vào thực nghiệm | `data/reference/retrospective_pre_inputs.json` |
 | Hình ảnh | Các thư mục `assets/champions/`, `assets/teams/`, `assets/players/`. Thiếu ảnh không chặn việc phân tích. |
 
@@ -169,7 +172,7 @@ Cần đủ mười tuyển thủ khác nhau, mỗi người ở một vị trí
 
 ### Bước 2. Tạo và xem PRE
 
-Nhấn **Tạo PRE**. Hệ thống tổng hợp lịch sử hợp lệ, tính xác suất và lưu bản đánh giá. Kết quả gồm xác suất thắng hai đội, các thống kê lịch sử, số mẫu và cảnh báo. Ghi lại **Mã PRE đã lưu** nếu muốn tra cứu sau.
+Nhấn **Tạo PRE**. Hệ thống tổng hợp lịch sử hợp lệ, tính xác suất và lưu bản đánh giá. Mỗi mô hình có một thanh PRE chia hai phần BLUE/RED, kèm tên đội và phần trăm bằng chữ; các thống kê lịch sử, số mẫu và cảnh báo dùng chung nằm bên dưới. Ghi lại **Mã PRE đã lưu** nếu muốn tra cứu sau.
 
 Mốc giới hạn lịch sử trong phiên tương tác được tính tại lúc tạo PRE: **00:00 UTC của ngày liền trước ngày tạo PRE theo UTC**. POST giữ nguyên mốc và thông tin nền này. Mốc trên là quy tắc lọc lịch sử, không phải thời điểm bắt đầu cấm/chọn được lấy trực tiếp từ giải đấu.
 
@@ -181,7 +184,7 @@ Kết quả POST hiển thị xác suất mới, lịch sử tuyển thủ–tư
 
 ### Bước 4. Xem so sánh và xử lý khi đổi đầu vào
 
-Phần so sánh hiển thị hai xác suất và mức thay đổi theo điểm phần trăm. Ví dụ cách đọc: từ 54% lên 58% là **tăng 4 điểm phần trăm**. Đây chỉ là ví dụ giải thích đơn vị, không phải kết quả thực nghiệm.
+Sau POST, mỗi hàng mô hình có hai thanh PRE và POST trên cùng thang 0–100%, kèm thay đổi có dấu của cả hai đội. Ví dụ cách đọc: từ 54% lên 58% là **tăng 4 điểm phần trăm**. Đây chỉ là ví dụ giải thích đơn vị, không phải kết quả thực nghiệm. Baseline dùng tỷ lệ thắng BLUE học từ tập train nên PRE và POST có thể bằng nhau. Xác suất cao hơn ở một ván không chứng minh mô hình tốt hơn; Brier Score, Log Loss, ROC-AUC và calibration cần được đối chiếu riêng trên cùng tập đánh giá.
 
 | Thao tác thay đổi | Cách tiếp tục |
 | --- | --- |
@@ -195,7 +198,7 @@ Số mẫu ít là hạn chế của dữ liệu, không phải bằng chứng t
 
 Mở **Xem đánh giá đã lưu**, nhập mã vào ô **Mã đánh giá đã lưu** rồi nhấn **Đọc bản lưu**. Mã đánh giá là số được cấp sau khi lưu thành công.
 
-Phần này chỉ hiển thị lại đầu vào, kết quả, cảnh báo và trạng thái bản lưu; không khôi phục phiên để tiếp tục tạo POST. Để phân tích lại, thiết lập đầu vào trong phiên hiện tại.
+Phần này chỉ hiển thị lại đầu vào, kết quả, cảnh báo và trạng thái bản lưu; không khôi phục phiên để tiếp tục tạo POST. Để phân tích lại, thiết lập đầu vào trong phiên hiện tại. Kết quả ba mô hình và identity từng bộ pipeline được lưu chung trong `input_snapshot.provenance.model_comparison` của đánh giá canonical, cùng transaction. Bản lưu cũ chỉ có một mô hình vẫn được đọc nguyên trạng; ứng dụng không tính thêm hoặc ghi đè dự đoán cũ.
 
 ## 5. Lỗi thường gặp
 
@@ -205,7 +208,7 @@ Phần này chỉ hiển thị lại đầu vào, kết quả, cảnh báo và t
 | `No module named ensurepip` | Bản Python đang dùng thiếu thành phần tạo pip. Cần bản Python đầy đủ đúng phiên bản ở mục 3.1 rồi tạo môi trường riêng trên máy. |
 | `No matching distribution found` khi cài thư viện | Gửi lỗi cho sinh viên để kiểm tra bản Python, kho gói và bộ môi trường bàn giao. Không tự sửa các phiên bản đã cố định. |
 | Thiếu `DATABASE_URL` hoặc không kết nối được | Kiểm tra `.env`, tài khoản, tên database, cổng và dịch vụ PostgreSQL; chú ý biến môi trường có thể ghi đè `.env`. |
-| Chưa có đủ tệp model / không nạp được model | Kiểm tra cặp `.joblib` và `.json` cùng tên trong `artifacts/models/` và file `retrospective_pre_inputs.json`. |
+| Chưa có đủ tệp model / không nạp được model | Kiểm tra cặp `.joblib` và `.json` trong `artifacts/models/`, manifest cùng hai `.joblib` trong `artifacts/models_comparison/`, và file `retrospective_pre_inputs.json`. Không thay mô hình bằng số dự đoán giả. |
 | Model không tương thích với môi trường | Đối chiếu đủ sáu phiên bản ở mục 3.1, bao gồm phiên bản vá của Python. |
 | Dữ liệu hoặc file đầu vào không khớp bản đã duyệt | Dùng đúng bộ PostgreSQL, hồ sơ thời gian và mô hình được bàn giao cùng nhau. Không bỏ qua kiểm tra mã băm. |
 | Lần nạp dữ liệu chưa hoàn tất | Khắc phục nguyên nhân rồi nhấn **Thử nạp lại**. |

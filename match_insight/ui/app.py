@@ -8,13 +8,14 @@ from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from uuid import uuid4
 
+import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image, ImageOps
 
 from match_insight import SYSTEM_NAME
 from match_insight.data_processing.reference_common import _IMAGE_EXTENSIONS
 from match_insight.features.pre import ROLES, PlayerSlot, PreFeatureInputError
-from match_insight.services import demo, evaluation, persistence
+from match_insight.services import demo, evaluation, model_comparison, persistence
 from match_insight.services.evaluation import EvaluationState
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -149,7 +150,7 @@ def _clear_stored_post():
     st.session_state.pop("stored_post_id", None)
     st.session_state.pop("pending_post", None)
     cache = st.session_state.get("presentation_cache", {})
-    for key in ("post_summary", "lineup", "comparison"):
+    for key in ("post_summary", "lineup", "comparison", "models_post"):
         cache.pop(key, None)
     state = st.session_state.get("evaluation_state")
     if isinstance(state, EvaluationState) and state.post is not None:
@@ -210,6 +211,23 @@ def _comparison(runtime, pre, post):
     )
 
 
+def _model_results(runtime, pre, post=None):
+    models = st.session_state["comparison_models"]
+    pre_result = _view_value(
+        "models_pre", runtime, pre,
+        lambda: model_comparison.predict_pre_comparison(pre, runtime.bundle, models),
+        choices=models.model_set_id,
+    )
+    if post is None:
+        return pre_result
+    return _view_value(
+        "models_post", runtime, pre,
+        lambda: model_comparison.predict_post_comparison(
+            pre, post, runtime.bundle, models, pre_result,
+        ), post=post, choices=models.model_set_id,
+    )
+
+
 def _save_provenance(runtime, pre, post=None):
     target = pre.request.target
     player_ids = {slot.player_id for slot in target.blue_roster + target.red_roster}
@@ -227,6 +245,7 @@ def _save_provenance(runtime, pre, post=None):
             if item.identity in champion_ids
         },
         "history_coverage": _history_summary(runtime, pre, post),
+        "model_comparison": _model_results(runtime, pre, post),
     }
 
 
@@ -281,6 +300,9 @@ def _message(error):
         "E_PRE_HISTORY_MISMATCH": "Lịch sử không còn khớp PRE đã lưu.",
         "E_MODEL_LIBRARY_MISMATCH": "Model không tương thích với môi trường hiện tại.",
         "E_MODEL_BUNDLE_INVALID": "Không thể nạp model đã được duyệt.",
+        "E_MODEL_COMPARISON_MISSING": (
+            "Chưa có đủ artifact của ba mô hình. Hãy chuẩn bị bộ model so sánh trước khi mở ứng dụng."
+        ),
         "E_REAL_MODEL_METADATA_MISSING": "Chưa có đủ tệp model đã được duyệt.",
         "E_REAL_MODEL_METADATA_INVALID": "Thông tin model không hợp lệ.",
         "E_REAL_MODEL_IDENTITY_MISMATCH": "Model không khớp bản đã được duyệt.",
@@ -343,13 +365,20 @@ def _show_saved_evaluation(record):
     )
     st.caption(f"Nhập/lưu lúc: {record.get('created_at')}")
     st.caption("Chỉ xem lại kết quả đã lưu; không tiếp tục POST từ bản xem lại này.")
-    blue = document["prediction"]["p_blue_win"]
-    for side, probability, column in zip(("blue", "red"), (blue, 1 - blue), st.columns(2), strict=True):
-        identity = target[f"{side}_team_id"]
-        column.metric(
-            f"{names.get(identity, identity)} thắng — {record['evaluation_type']} đã lưu",
-            f"{probability:.1%}",
-        )
+    model_results = provenance.get("model_comparison")
+    if model_results is not None:
+        _show_model_results(model_results, SimpleNamespace(**target), names, key_prefix="saved")
+    else:
+        st.caption("Bản lưu này chỉ có kết quả của mô hình được chọn tại thời điểm đánh giá.")
+        blue = document["prediction"]["p_blue_win"]
+        for side, probability, column in zip(
+            ("blue", "red"), (blue, 1 - blue), st.columns(2), strict=True,
+        ):
+            identity = target[f"{side}_team_id"]
+            column.metric(
+                f"{names.get(identity, identity)} thắng — {record['evaluation_type']} đã lưu",
+                f"{probability:.1%}",
+            )
     features = document["features"]
     if record["evaluation_type"] == "PRE":
         for side, column in zip(("blue", "red"), st.columns(2), strict=True):
@@ -383,7 +412,9 @@ def _show_saved_evaluation(record):
                         if item["games_count"] else f"0 ván · {MISSING_HISTORY}"
                     )
         comparison = document.get("comparison")
-        if isinstance(comparison, dict) and all(key in comparison for key in ("pre", "post", "comparison")):
+        if model_results is None and isinstance(comparison, dict) and all(
+            key in comparison for key in ("pre", "post", "comparison")
+        ):
             _show_comparison(comparison, SimpleNamespace(**target), names)
     for warning in record["warnings"]:
         st.warning(f"{warning['message']} [{warning['warning_code']}]")
@@ -625,13 +656,8 @@ def _show_coverage(summary, names):
 
 def _show_pre(snapshot, names, summary):
     pre = snapshot.features
-    probabilities = demo.phase_probabilities(snapshot)
-    st.caption("Xác suất ước lượng của hệ thống")
-    for column, team, probability in zip(
-        st.columns(2), (pre.blue, pre.red), probabilities, strict=True,
-    ):
+    for column, team in zip(st.columns(2), (pre.blue, pre.red), strict=True):
         with column:
-            st.metric(f"{names[team.team_id]} thắng — PRE", f"{probability:.1%}")
             st.markdown(f"**Lịch sử của {names[team.team_id]}**")
             for label, stat, continuity in (
                 ("Phong độ trong kho lịch sử", team.recent_form, False),
@@ -645,7 +671,6 @@ def _show_pre(snapshot, names, summary):
         f"{pre.h2h_blue.sample_count} ván"
         + ("." if pre.h2h_blue.win_count is None else f" · {pre.h2h_blue.win_count} thắng.")
     )
-    _show_warnings(snapshot.warnings, names)
     if summary is not None:
         _show_coverage(summary, names)
 
@@ -676,16 +701,6 @@ def _champion_widgets(pre, players, champions):
 
 
 def _show_post(snapshot, names, players, champions):
-    target = snapshot.pre.request.target
-    st.caption("Xác suất ước lượng của hệ thống")
-    for column, team_id, probability in zip(
-        st.columns(2), (target.blue_team_id, target.red_team_id),
-        demo.phase_probabilities(snapshot), strict=True,
-    ):
-        column.metric(f"{names[team_id]} thắng — POST", f"{probability:.1%}")
-    _show_warnings(
-        tuple(item for item in snapshot.warnings if item.code == "W_PAIR_HISTORY_MISSING"), names,
-    )
     st.caption("Tỷ lệ lịch sử của cặp tuyển thủ–tướng; không phải xác suất thắng ván đang phân tích.")
     features = {(item.side, item.role): item for item in snapshot.features.player_champion}
     for role in ROLES:
@@ -731,6 +746,60 @@ def _show_comparison(comparison, target, names):
     _show_warnings(comparison["warnings"], names)
 
 
+def _probability_figure(row, blue_name, red_name):
+    """Only presentation: probabilities and deltas are supplied by the service."""
+    phases = ("pre", "post") if "post" in row else ("pre",)
+    figure = go.Figure()
+    for side, name, color in (
+        ("blue", blue_name, "#2563eb"), ("red", red_name, "#ef4444"),
+    ):
+        values = [row[phase][f"{side}_win_probability"] for phase in phases]
+        figure.add_bar(
+            name=f"{side.upper()} · {escape(name)}", orientation="h",
+            y=[phase.upper() for phase in phases], x=[100 * value for value in values],
+            marker_color=color, text=[f"{value:.1%}" for value in values],
+            textposition="inside", insidetextanchor="middle", constraintext="inside",
+            hovertemplate="%{fullData.name} · %{y}: %{x:.2f}%<extra></extra>",
+        )
+    figure.update_layout(
+        barmode="stack", height=220 if len(phases) == 2 else 170,
+        margin={"l": 0, "r": 32, "t": 0, "b": 0}, bargap=0.35,
+        legend={"orientation": "h", "y": -0.35, "x": 0,
+                "traceorder": "normal", "itemclick": False, "itemdoubleclick": False},
+        xaxis={"range": [0, 100], "tickvals": [0, 25, 50, 75, 100],
+               "ticktext": ["0%", "25%", "50%", "75%", "100%"], "fixedrange": True},
+        yaxis={"autorange": "reversed", "fixedrange": True},
+        font={"size": 14},
+    )
+    return figure
+
+
+def _show_model_results(result, target, names, *, key_prefix="live"):
+    st.subheader("So sánh dự đoán của ba mô hình")
+    blue_name, red_name = names[target.blue_team_id], names[target.red_team_id]
+    for row in result["models"]:
+        st.markdown(f"**{row['label']}**")
+        st.plotly_chart(
+            _probability_figure(row, blue_name, red_name), width="stretch",
+            key=f"{key_prefix}_model_{row['family']}", config={"displayModeBar": False},
+        )
+        # Always visible, including tiny/zero segments and narrow mobile screens.
+        for phase in ("pre", "post") if "post" in row else ("pre",):
+            values = row[phase]
+            st.write(
+                f"{phase.upper()} · BLUE — {blue_name}: {values['blue_win_probability']:.1%}"
+                f" · RED — {red_name}: {values['red_win_probability']:.1%}"
+            )
+        if "comparison" in row:
+            for side, name in (("blue", blue_name), ("red", red_name)):
+                delta = evaluation.percentage_points(row["comparison"][f"{side}_probability_delta"])
+                st.write(f"Δ {side.upper()} — {name}: {delta:+.1f} điểm phần trăm")
+    st.caption("Cùng bối cảnh, lịch sử và đội hình; BLUE/RED luôn chỉ bên thi đấu.")
+    if result["phase"] == "POST":
+        st.caption("Xác suất ước lượng của mô hình thay đổi từ PRE sang POST.")
+    st.caption("Xác suất cao hơn ở một ván không chứng minh mô hình có chất lượng tốt hơn.")
+
+
 def _initialize_runtime():
     """Automatically load once per session; failures require an explicit retry."""
     previous_error = st.session_state.get("runtime_load_error")
@@ -742,7 +811,10 @@ def _initialize_runtime():
         st.session_state["runtime_load_error"] = "Lần nạp trước chưa hoàn tất. Hãy thử nạp lại."
         with st.spinner("Đang chuẩn bị dữ liệu và mô hình…"):
             try:
-                runtime = demo.load_analysis_runtime()
+                loaded_runtime = demo.load_analysis_runtime()
+                models = model_comparison.load_models(loaded_runtime.bundle)
+                runtime = loaded_runtime
+                st.session_state["comparison_models"] = models
             except PreFeatureInputError as error:
                 st.session_state["runtime_load_error"] = _message(error)
             except Exception:
@@ -785,6 +857,7 @@ def run():
     if runtime is not None and (
         not isinstance(runtime, demo.AnalysisRuntime)
         or not isinstance(st.session_state.get("analysis_input"), demo.AnalysisInput)
+        or st.session_state.get("comparison_models") is None
     ):
         # Streamlit can retain an old retrospective session when this page is upgraded.
         # Start a fresh interactive session, never relabel its old snapshots.
@@ -792,7 +865,7 @@ def run():
             "demo_runtime", "analysis_input", "roster_suggestions", "roster_teams",
             "target_game", "blue_team", "red_team", "analysis_patch", "analysis_context",
             "selection_coverage", "roster_coverage", "team_catalog_scope", "player_catalog_scope",
-            "runtime_load_error",
+            "runtime_load_error", "comparison_models",
         ):
             st.session_state.pop(key, None)
         for side in ("BLUE", "RED"):
@@ -887,6 +960,7 @@ def run():
 
     summary = _attempt(lambda: _history_summary(runtime, state.pre))
     st.caption(f"Mã PRE đã lưu: {st.session_state['stored_pre_id']}")
+    results_slot = st.container()
     _show_pre(state.pre, names, summary)
     st.subheader("Đội hình cuối cùng — năm vị trí mỗi đội")
     champions = {
@@ -933,5 +1007,14 @@ def run():
             return
         st.subheader("POST — đội hình đã xác nhận")
         st.caption(f"Mã POST đã lưu: {st.session_state['stored_post_id']}")
+        # Show the paired bars beside the completed POST action, not only far
+        # above the lineup where the user would have to scroll back to find them.
+        results_slot = st.container()
         _show_post(state.post, names, players, champions)
-        _show_comparison(comparison, state.pre.request.target, names)
+    with results_slot:
+        result = _attempt(lambda: _model_results(runtime, state.pre, state.post))
+        if result is not None:
+            _show_model_results(result, state.pre.request.target, names)
+            _show_warnings(
+                state.pre.warnings if state.post is None else comparison["warnings"], names,
+            )
