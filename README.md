@@ -1,41 +1,237 @@
-# Match Insight
+<div align="center">
 
-Hệ thống hỗ trợ khán giả so sánh xác suất thắng của hai đội trong một ván Liên Minh Huyền Thoại chuyên nghiệp trước và sau cấm/chọn.
+# MATCH INSIGHT
 
-**Giao diện mới: React + TypeScript + FastAPI.** Xem [hướng dẫn cài đặt, chạy demo và kiến trúc](docs/React_FastAPI.md). Dùng chung dữ liệu PostgreSQL và ba mô hình đã huấn luyện; không cần thu thập dữ liệu hay huấn luyện lại khi chuyển giao diện.
+### *Read the Rift before the game begins.*
 
-Chạy lệnh tại **thư mục gốc dự án**, nơi có file `README.md`:
+**Phân tích xác suất thắng của một ván Liên Minh Huyền Thoại chuyên nghiệp
+trước và sau giai đoạn cấm/chọn.**
+
+<br>
+
+[![React](https://img.shields.io/badge/React-19-0b1f2a?style=for-the-badge\&logo=react\&logoColor=61DAFB)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-0b1f2a?style=for-the-badge\&logo=typescript\&logoColor=3178C6)](https://www.typescriptlang.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-API-0b1f2a?style=for-the-badge\&logo=fastapi\&logoColor=009688)](https://fastapi.tiangolo.com/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-0b1f2a?style=for-the-badge\&logo=postgresql\&logoColor=4169E1)](https://www.postgresql.org/)
+[![scikit-learn](https://img.shields.io/badge/scikit--learn-ML-0b1f2a?style=for-the-badge\&logo=scikitlearn\&logoColor=F7931E)](https://scikit-learn.org/)
+
+<br>
+
+**React + TypeScript · FastAPI · PostgreSQL · Machine Learning**
+
+<br>
+
+[Khởi động](#quick-start) ·
+[Luồng phân tích](#the-match-flow) ·
+[Kiến trúc](#system-architecture) ·
+[Cài đặt](#installation) ·
+[Demo](#demo-flow) ·
+[Xử lý lỗi](#troubleshooting)
+
+</div>
+
+---
+
+> **PRE tells the story before the draft.
+> POST tells you what changed after ten champions entered the Rift.**
+
+Match Insight hỗ trợ khán giả phân tích một ván **League of Legends chuyên nghiệp** tại hai thời điểm:
+
+* **PRE** — trước khi đội hình tướng cuối cùng được xác định.
+* **POST** — sau khi cấm/chọn hoàn tất.
+
+Hệ thống không chỉ trả về một con số dự đoán. Nó giữ nguyên bối cảnh PRE, bổ sung thông tin đội hình ở POST và cho phép quan sát mức thay đổi xác suất giữa hai trạng thái trên cùng một ván đấu.
+
+Ba pipeline được hiển thị song song:
+
+| Model                   | Vai trò                                                 |
+| ----------------------- | ------------------------------------------------------- |
+| **Baseline**            | Mốc tham chiếu từ tỷ lệ thắng BLUE trong tập huấn luyện |
+| **Logistic Regression** | Mô hình canonical của hệ thống                          |
+| **Random Forest**       | Pipeline bổ sung để đối chiếu hành vi dự báo            |
+
+> [!NOTE]
+> Chênh lệch PRE → POST được biểu diễn bằng **điểm phần trăm**.
+> Đây là thay đổi trong dự báo của mô hình, không phải bằng chứng cho quan hệ nhân quả giữa draft và kết quả trận đấu.
+
+---
+
+# The Match Flow
+
+```text
+                 ┌──────────────────────────────┐
+                 │       MATCH CONTEXT          │
+                 │ teams · side · patch · roster│
+                 └──────────────┬───────────────┘
+                                │
+                                ▼
+                      ┌──────────────────┐
+                      │       PRE        │
+                      │ win probability  │
+                      └────────┬─────────┘
+                               │
+                               │ Final draft
+                               ▼
+             ┌──────────────────────────────────┐
+             │        10 FINAL CHAMPIONS        │
+             │ player × champion history       │
+             └────────────────┬─────────────────┘
+                              │
+                              ▼
+                      ┌──────────────────┐
+                      │       POST       │
+                      │ win probability  │
+                      └────────┬─────────┘
+                               │
+                               ▼
+                    PRE  ───────►  POST
+                        Δ probability
+```
+
+### PRE
+
+PRE sử dụng thông tin có trước khi đội hình tướng cuối cùng được xác định:
+
+* hai đội thi đấu;
+* BLUE / RED side;
+* patch;
+* roster;
+* phong độ lịch sử;
+* thành tích theo side;
+* đối đầu;
+* mức độ liên tục của đội hình.
+
+### POST
+
+POST giữ nguyên toàn bộ bối cảnh PRE và bổ sung:
+
+* mười tướng cuối cùng;
+* lịch sử tuyển thủ–tướng;
+* số mẫu lịch sử liên quan;
+* cảnh báo khi chưa ghi nhận cặp tuyển thủ–tướng.
+
+### Comparison
+
+Mỗi mô hình hiển thị:
+
+```text
+PRE probability
+POST probability
+Δ percentage points
+```
+
+Có thể chuyển đội đang xem để quan sát xác suất theo phía còn lại.
+
+---
+
+# Stack
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### Frontend
+
+**React**
+**TypeScript**
+
+Giao diện nhập dữ liệu, tìm kiếm đội / tuyển thủ / tướng và bảng so sánh PRE–POST.
+
+</td>
+
+<td width="33%" valign="top">
+
+### Backend
+
+**FastAPI**
+**Python**
+
+Quản lý phiên phân tích, điều phối PRE / POST, phục vụ assets và API.
+
+</td>
+
+<td width="33%" valign="top">
+
+### Data & ML
+
+**PostgreSQL**
+**pandas**
+**scikit-learn**
+
+Lịch sử thi đấu, feature engineering, model inference và lưu evaluation.
+
+</td>
+</tr>
+</table>
+
+Nguồn dữ liệu lịch sử:
+
+* **Oracle's Elixir** — dữ liệu thi đấu chuyên nghiệp.
+* **Riot Data Dragon** — metadata và hình ảnh tướng.
+
+Bản **Streamlit + Plotly** trước đây vẫn được giữ lại để đối chiếu.
+
+---
+
+# Quick Start
+
+> Chạy các lệnh tại **thư mục gốc của project**, nơi chứa `README.md`.
 
 ```powershell
 cd "C:\Đồ án ngành"
+
 .\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-web.txt
+
 .\scripts\start_web.ps1
 ```
 
-Thay đường dẫn ở lệnh `cd` nếu dự án nằm ở nơi khác. Mở **http://127.0.0.1:8000**; tài liệu API tại **http://127.0.0.1:8000/docs**. Script cài thư viện frontend bằng lockfile khi cần, build React và chạy FastAPI. Cần cấu hình dữ liệu và mô hình theo mục 3 trước khi phân tích.
+Nếu dự án nằm ở nơi khác, thay đường dẫn của lệnh `cd`.
 
-## 1. Tóm tắt hệ thống
+Sau khi server khởi động:
 
-| Chức năng | Nội dung |
-| --- | --- |
-| Đánh giá PRE | Ước lượng xác suất thắng từ bối cảnh ván đấu và lịch sử: phong độ, thành tích theo bên, đối đầu và mức độ liên tục đội hình. |
-| Đánh giá POST | Giữ nguyên thông tin nền của PRE, bổ sung đội hình mười tướng và lịch sử tuyển thủ–tướng để tính xác suất sau cấm/chọn. |
-| So sánh | Ba hàng Baseline, Logistic Regression và Random Forest; các cột PRE, POST và thay đổi theo **điểm phần trăm**. Chuyển tên đội để xem xác suất của bên tương ứng. |
-| Lưu và xem lại | Lưu đầu vào, kết quả và cảnh báo trong PostgreSQL; xem lại bằng mã đánh giá. |
+```text
+Application   http://127.0.0.1:8000
+API Docs      http://127.0.0.1:8000/docs
+```
 
-Ứng dụng sử dụng Python, pandas và scikit-learn để xử lý dữ liệu và chạy mô hình; PostgreSQL để lưu trữ; React và FastAPI cho giao diện web mới. Bản Streamlit/Plotly vẫn có thể chạy để đối chiếu. Dữ liệu lịch sử đến từ Oracle’s Elixir; Data Dragon hỗ trợ danh mục và hình ảnh tướng. Giao diện hiển thị **Baseline, Logistic Regression và Random Forest** trên cùng đầu vào PRE/POST. Logistic Regression vẫn là mô hình canonical đã được chọn; hai bộ pipeline bổ sung dùng nguyên dữ liệu, split, seed và cách tiền xử lý của lần thực nghiệm đó. Giao diện chỉ nạp pipeline đã fit, không huấn luyện khi mở trang hoặc tạo đánh giá.
+Script sẽ:
 
-Người dùng cung cấp thông tin ván đấu và đội hình cuối cùng. Ứng dụng không tự lấy diễn biến cấm/chọn trực tiếp, không cập nhật xác suất trong ván và không đưa ra khuyến nghị cá cược hoặc chọn tướng. Chênh lệch PRE–POST là thay đổi dự báo của mô hình, không chứng minh tác động nhân quả của đội hình.
+```text
+install frontend dependencies when required
+        ↓
+build React
+        ↓
+start FastAPI
+        ↓
+serve the application
+```
 
-## 2. Khởi động và cập nhật giao diện
+> [!IMPORTANT]
+> Cơ sở dữ liệu PostgreSQL và các model artifact phải được cấu hình trước khi tạo PRE hoặc POST.
 
-Khi đã có `.venv`, `.env`, PostgreSQL, mô hình và bản build React:
+Xem thêm:
+
+**[`docs/React_FastAPI.md`](docs/React_FastAPI.md)**
+
+---
+
+# Running an Existing Build
+
+Nếu `.venv`, `.env`, PostgreSQL, model và React build đã sẵn sàng:
 
 ```powershell
 .\scripts\start_web.ps1 -SkipBuild
 ```
 
-Giữ terminal mở khi sử dụng; nhấn **Ctrl+C** để dừng. Sau khi sửa mã frontend hoặc lấy mã mới từ Git, cần build lại:
+Giữ terminal mở trong quá trình sử dụng.
+
+Dừng server bằng:
+
+```text
+Ctrl + C
+```
+
+Sau khi chỉnh sửa frontend:
 
 ```powershell
 npm.cmd --prefix frontend ci
@@ -43,56 +239,171 @@ npm.cmd --prefix frontend run build
 .\scripts\start_web.ps1 -SkipBuild
 ```
 
-Nếu máy chủ đang chạy, chỉ cần hai lệnh npm rồi tải lại trình duyệt bằng **Ctrl+F5** để nhận bản giao diện mới. Nếu mã Python thay đổi, dừng và khởi động lại máy chủ.
+Nếu server vẫn đang chạy và chỉ frontend thay đổi:
 
-Mô hình và lịch sử được nạp một lần mỗi tiến trình. Ứng dụng chạy một worker; khởi động lại máy chủ làm mất phiên phân tích trong RAM, nhưng bản đánh giá đã lưu trong PostgreSQL vẫn tra cứu được bằng mã.
+```powershell
+npm.cmd --prefix frontend ci
+npm.cmd --prefix frontend run build
+```
 
-Bản Streamlit cũ vẫn có thể chạy riêng để đối chiếu:
+Sau đó dùng:
+
+```text
+Ctrl + F5
+```
+
+Nếu Python backend thay đổi, cần restart server.
+
+---
+
+# Legacy Interface
+
+Bản Streamlit cũ vẫn có thể chạy riêng:
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -B -m streamlit run streamlit_app.py
 ```
 
-Địa chỉ mặc định của bản Streamlit là `http://localhost:8501`.
+Mặc định:
 
-## 3. Cài đặt trên máy mới
+```text
+http://localhost:8501
+```
 
-Giải nén bản bàn giao vào thư mục trên máy, mở **Windows PowerShell** tại thư mục chứa `README.md` và `streamlit_app.py`. Chạy lần lượt các lệnh bên dưới; không sao chép phần dấu nhắc `PS ...>` hoặc `>>` từ ảnh terminal. Nếu một bước báo lỗi, xử lý lỗi trước khi chạy bước tiếp theo.
+---
 
-Bản bàn giao cần có mã nguồn, mô hình đã huấn luyện, các file dữ liệu đi kèm và bản sao PostgreSQL được liệt kê ở mục 3.4. Nếu thiếu thành phần nào, cần yêu cầu sinh viên cung cấp bổ sung trước khi chạy.
+# System Architecture
 
-### 3.1. Chuẩn bị Python, Node.js và PostgreSQL
+```mermaid
+flowchart LR
+    User["User"]
 
-Cần Node.js và npm để cài/build frontend (môi trường đã chạy thử dùng Node.js 24), Python, PostgreSQL đang hoạt động và tài khoản có quyền đọc dữ liệu, lưu đánh giá. Nếu phục hồi dữ liệu bằng dòng lệnh, cần thêm các công cụ PostgreSQL `psql` và `pg_restore` trong `PATH`; cũng có thể dùng pgAdmin để tạo cơ sở dữ liệu và phục hồi bản sao.
+    subgraph Client["CLIENT"]
+        React["React + TypeScript"]
+    end
 
-Bộ nạp mô hình kiểm tra chính xác sáu phiên bản dưới đây, lấy từ `artifacts/models/retrospective_pre_post.json`:
+    subgraph Backend["APPLICATION"]
+        API["FastAPI"]
+        Session["Analysis Session"]
+        PRE["PRE Service"]
+        POST["POST Service"]
+        Compare["Comparison Service"]
+    end
 
-| Thành phần | Phiên bản của bộ mô hình đi kèm |
-| --- | --- |
-| Python | 3.12.14 |
-| NumPy | 2.5.2 |
-| pandas | 3.0.5 |
-| scikit-learn | 1.9.0 |
-| SciPy | 1.18.1 |
-| joblib | 1.5.3 |
+    subgraph Intelligence["MODEL LAYER"]
+        Feature["Feature Engineering"]
+        LR["Logistic Regression"]
+        RF["Random Forest"]
+        Base["Baseline"]
+    end
 
-Kiểm tra Python trước khi tạo môi trường:
+    subgraph Storage["DATA"]
+        DB[("PostgreSQL")]
+        Models["Model Artifacts"]
+        Assets["Teams / Players / Champions"]
+    end
+
+    User --> React
+    React --> API
+
+    API --> Session
+    Session --> PRE
+    Session --> POST
+    Session --> Compare
+
+    PRE --> Feature
+    POST --> Feature
+
+    Feature --> LR
+    Feature --> RF
+    Feature --> Base
+
+    LR --> Models
+    RF --> Models
+    Base --> Models
+
+    PRE --> DB
+    POST --> DB
+    Compare --> DB
+
+    Assets --> React
+```
+
+---
+
+# Installation
+
+## 1 — Runtime Requirements
+
+Máy chạy hệ thống cần:
+
+```text
+Python      3.12.14
+Node.js     24.x tested
+npm
+PostgreSQL
+```
+
+Nếu phục hồi database bằng CLI:
+
+```text
+psql
+pg_restore
+```
+
+cần có trong `PATH`.
+
+Có thể dùng **pgAdmin** thay thế cho thao tác phục hồi bằng command line.
+
+---
+
+## 2 — Model Environment
+
+Model loader kiểm tra chính xác môi trường đã dùng cho model bundle.
+
+| Component    |   Version |
+| ------------ | --------: |
+| Python       | `3.12.14` |
+| NumPy        |   `2.5.2` |
+| pandas       |   `3.0.5` |
+| scikit-learn |   `1.9.0` |
+| SciPy        |  `1.18.1` |
+| joblib       |   `1.5.3` |
+
+Nguồn metadata:
+
+```text
+artifacts/models/retrospective_pre_post.json
+```
+
+Kiểm tra Python:
 
 ```powershell
 python --version
 ```
 
-Để dùng bộ mô hình này, kết quả cần là `Python 3.12.14`. Nếu máy có nhiều bản Python, dùng đường dẫn tới đúng `python.exe` ở bước tạo môi trường. Không thay số phiên bản trong metadata để bỏ qua kiểm tra tương thích.
+Kết quả cần là:
 
-### 3.2. Tạo môi trường và cài thư viện
+```text
+Python 3.12.14
+```
 
-Trên máy mới, tạo môi trường riêng bằng Python đã kiểm tra ở mục 3.1. Không dùng lại thư mục `.venv` chép từ máy khác. Nếu máy hiện tại đã có `.venv` đúng phiên bản, bỏ qua lệnh tạo môi trường:
+> [!WARNING]
+> Không chỉnh metadata hoặc thay version chỉ để vượt qua compatibility check.
+
+---
+
+## 3 — Virtual Environment
+
+Trên máy mới:
 
 ```powershell
 python -m venv .venv
 ```
 
-Kiểm tra Python của môi trường và chuẩn bị pip để cài thư viện:
+Không nên sao chép `.venv` từ máy khác.
+
+Kiểm tra:
 
 ```powershell
 .\.venv\Scripts\python.exe --version
@@ -100,26 +411,55 @@ Kiểm tra Python của môi trường và chuẩn bị pip để cài thư vi�
 .\.venv\Scripts\python.exe -m pip --version
 ```
 
-Kết quả Python cần là `3.12.14`; lệnh cuối cần hiển thị phiên bản pip. Nếu trước đó gặp lỗi `No module named pip`, lệnh `ensurepip` dùng để bổ sung pip vào chính môi trường này. Nếu cả `ensurepip` cũng không có, cần dùng bản Python đầy đủ có hỗ trợ `venv` và `ensurepip` để tạo môi trường.
+Python cần trả về:
 
-Cài các thư viện chạy ứng dụng và kiểm tra phụ thuộc:
+```text
+3.12.14
+```
+
+Cài dependency:
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-web.txt
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-Kết quả mong đợi của lệnh kiểm tra là `No broken requirements found.` Đây là kiểm tra phụ thuộc thư viện; cần hoàn thành cấu hình dữ liệu và mở ứng dụng ở các bước tiếp theo để kiểm tra bản bàn giao.
+Kết quả mong đợi:
 
-`requirements-web.txt` cài FastAPI, Uvicorn và bao gồm `requirements.txt`. File `requirements.txt` đã cố định phiên bản NumPy, pandas, scikit-learn, SciPy và joblib theo metadata của mô hình, đồng thời khai báo Pillow và `psycopg[binary]`. File này không cài hoặc thay đổi phiên bản Python; môi trường `.venv` vẫn cần dùng Python 3.12.14.
+```text
+No broken requirements found.
+```
 
-`requirements-dev.txt` dành cho việc phát triển mã nguồn, không cần dùng để cài bản chạy chấm bài.
+### Dependency files
 
-`psycopg[binary]` cung cấp thành phần kết nối PostgreSQL cho Python trên Windows. Các lệnh gọi trực tiếp Python trong `.venv`, nên không cần chạy `Activate.ps1` hoặc đổi `ExecutionPolicy`. Nếu pip báo không tìm thấy một phiên bản đã cố định, cần gửi lỗi cho sinh viên để kiểm tra và cung cấp môi trường tương thích; không tự đổi phiên bản hay sửa metadata để bỏ qua kiểm tra.
+```text
+requirements.txt
+    core runtime + ML dependencies
 
-### 3.3. Cấu hình kết nối
+requirements-web.txt
+    FastAPI + Uvicorn + requirements.txt
 
-Tạo `.env` từ file mẫu nếu chưa có:
+requirements-dev.txt
+    development and testing
+```
+
+`requirements.txt` đã cố định các phiên bản ML tương thích với model bundle.
+
+`psycopg[binary]` được sử dụng để kết nối PostgreSQL trên Windows.
+
+Không cần:
+
+```powershell
+Activate.ps1
+```
+
+vì các lệnh sử dụng trực tiếp Python trong `.venv`.
+
+---
+
+# Database Configuration
+
+Tạo `.env` từ file mẫu:
 
 ```powershell
 if (-not (Test-Path -LiteralPath .env)) {
@@ -127,155 +467,806 @@ if (-not (Test-Path -LiteralPath .env)) {
 }
 ```
 
-Mở `.env` và sửa dòng kết nối theo PostgreSQL trên máy:
+Ví dụ:
 
 ```dotenv
 DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/lol_prepost
 ```
 
-Thay `user`, `password`, địa chỉ máy chủ, cổng và tên cơ sở dữ liệu bằng thông tin thực tế. Nếu mật khẩu chứa ký tự đặc biệt như `@`, `#` hoặc `%`, cần mã hóa ký tự đó theo dạng URL. Không đặt dấu nháy bao quanh giá trị trong `.env` vì bộ đọc hiện tại không tự bỏ dấu nháy.
+Thay:
 
-Ứng dụng tự đọc `.env` ở thư mục gốc. Nếu PowerShell đã có biến môi trường `DATABASE_URL`, giá trị đó được ưu tiên hơn `.env`. Hai biến `WIKI_USERNAME_MATCH_INSIGHT` và `WIKI_PASSWORD_MATCH_INSIGHT` chỉ phục vụ các script lấy dữ liệu Leaguepedia; có thể để trống khi chạy giao diện với dữ liệu đã chuẩn bị. Không đưa `.env` chứa mật khẩu lên Git.
+```text
+user
+password
+host
+port
+database
+```
 
-### 3.4. Chuẩn bị dữ liệu và bộ mô hình
+bằng thông tin thực tế.
 
-**Chỉ có mã nguồn và cơ sở dữ liệu rỗng là chưa đủ để tạo PRE/POST.** Cần bộ dữ liệu và mô hình được bàn giao cùng nhau:
+Nếu mật khẩu chứa các ký tự như:
 
-| Thành phần | Vị trí hoặc yêu cầu |
-| --- | --- |
-| Dữ liệu PostgreSQL | Lịch sử ván đấu, danh mục đội/tuyển thủ/tướng, thông tin thời gian và các bảng lưu đánh giá. Dữ liệu lịch sử phải khớp bộ đầu vào đã cố định. |
-| Mô hình đã huấn luyện | `artifacts/models/retrospective_pre_post.joblib` |
-| Metadata mô hình | `artifacts/models/retrospective_pre_post.json` |
-| Manifest bộ ba mô hình | `artifacts/models_comparison/manifest.json` |
-| Pipeline Baseline bổ sung | `artifacts/models_comparison/baseline_pre_post.joblib` |
-| Pipeline Random Forest bổ sung | `artifacts/models_comparison/random_forest_pre_post.joblib` |
-| Hồ sơ thời gian và đầu vào thực nghiệm | `data/reference/retrospective_pre_inputs.json` |
-| Hình ảnh | Các thư mục `assets/champions/`, `assets/teams/`, `assets/players/`. Thiếu ảnh không chặn việc phân tích. |
+```text
+@
+#
+%
+```
 
-Các file `.joblib`, dữ liệu thô và một số tài nguyên bị loại khỏi Git bằng `.gitignore`. Khi chuyển máy, cần nhận thêm những thành phần này và bản sao PostgreSQL; dự án không có sẵn file sao lưu cơ sở dữ liệu trong mã nguồn.
+cần URL-encode trước.
 
-Nếu đã nhận **bản sao PostgreSQL dạng custom (`pg_dump -Fc`)**, có thể phục hồi vào một cơ sở dữ liệu mới bằng các lệnh sau. Thay tài khoản và đường dẫn mẫu trước khi chạy:
+Không đặt dấu nháy quanh `DATABASE_URL`.
+
+Nếu PowerShell đã tồn tại:
+
+```text
+DATABASE_URL
+```
+
+thì biến môi trường đó được ưu tiên hơn `.env`.
+
+Các biến:
+
+```text
+WIKI_USERNAME_MATCH_INSIGHT
+WIKI_PASSWORD_MATCH_INSIGHT
+```
+
+chỉ dùng cho script lấy dữ liệu Leaguepedia và có thể để trống khi chạy giao diện bằng dataset đã chuẩn bị.
+
+> [!CAUTION]
+> Không commit `.env` chứa mật khẩu lên repository.
+
+---
+
+# Required Data
+
+Chỉ source code và database rỗng **không đủ** để chạy phân tích.
+
+Hệ thống cần đồng thời database lịch sử và model bundle tương ứng.
+
+| Component              | Path / Requirement                                                |
+| ---------------------- | ----------------------------------------------------------------- |
+| PostgreSQL history     | Lịch sử game, team, player, champion, temporal data và evaluation |
+| Canonical model        | `artifacts/models/retrospective_pre_post.joblib`                  |
+| Model metadata         | `artifacts/models/retrospective_pre_post.json`                    |
+| Comparison manifest    | `artifacts/models_comparison/manifest.json`                       |
+| Baseline pipeline      | `artifacts/models_comparison/baseline_pre_post.joblib`            |
+| Random Forest pipeline | `artifacts/models_comparison/random_forest_pre_post.joblib`       |
+| Temporal reference     | `data/reference/retrospective_pre_inputs.json`                    |
+| Champion assets        | `assets/champions/`                                               |
+| Team assets            | `assets/teams/`                                                   |
+| Player assets          | `assets/players/`                                                 |
+
+Thiếu ảnh không ngăn hệ thống tạo đánh giá.
+
+Một số dữ liệu và `.joblib` không được lưu trên Git do `.gitignore`.
+
+---
+
+# Restoring PostgreSQL
+
+Với backup dạng:
+
+```text
+pg_dump -Fc
+```
+
+có thể tạo database mới:
 
 ```powershell
 psql -h localhost -U postgres -c "CREATE DATABASE lol_prepost;"
-pg_restore -h localhost -U postgres -d lol_prepost --no-owner --no-privileges --exit-on-error "C:\duong-dan\lol_prepost.backup"
 ```
 
-Hai lệnh này tạo và ghi dữ liệu vào PostgreSQL; dùng cho cơ sở dữ liệu mới, chưa có dữ liệu. Với bản sao dạng `.sql`, dùng công cụ phục hồi phù hợp của PostgreSQL hoặc pgAdmin thay cho `pg_restore`.
+Sau đó restore:
 
-Kiểm tra phiên bản lược đồ sau khi phục hồi:
+```powershell
+pg_restore `
+  -h localhost `
+  -U postgres `
+  -d lol_prepost `
+  --no-owner `
+  --no-privileges `
+  --exit-on-error `
+  "C:\duong-dan\lol_prepost.backup"
+```
+
+Với `.sql`, sử dụng `psql` hoặc pgAdmin.
+
+Kiểm tra schema:
 
 ```powershell
 .\.venv\Scripts\python.exe -m alembic current
 .\.venv\Scripts\python.exe -m alembic heads
 ```
 
-Revision mới nhất trong mã nguồn hiện tại là `c6e31a9d4b72`. Bản sao PostgreSQL bàn giao cần có cùng revision này. Nếu kết quả không khớp, yêu cầu sinh viên cung cấp bản sao đúng phiên bản; người chấm không cần tự nâng lược đồ hoặc xử lý chuyển dữ liệu.
+Revision hiện tại:
 
-Bộ nạp kiểm tra mã băm của dữ liệu lịch sử, hồ sơ thời gian và mô hình. Nếu một thành phần không khớp, ứng dụng sẽ chặn khởi tạo. Việc cập nhật lịch sử hoặc thay mô hình cần thực hiện đồng bộ, không chỉ chép đè một file hay sửa mã băm.
+```text
+c6e31a9d4b72
+```
 
-### 3.5. Kiểm tra kết nối và mở ứng dụng
+Database bàn giao cần tương ứng revision này.
 
-Lệnh sau chỉ thử kết nối và chạy `SELECT 1`, không ghi dữ liệu:
+Model loader còn kiểm tra hash của:
+
+```text
+historical data
+temporal reference
+model artifact
+```
+
+Các thành phần này cần được cập nhật đồng bộ.
+
+---
+
+# Database Check
+
+Kiểm tra kết nối mà không ghi dữ liệu:
 
 ```powershell
 .\.venv\Scripts\python.exe -c "from match_insight.database.engine import check_database_connection; print(check_database_connection())"
 ```
 
-Kết quả mong đợi là `1`. Sau đó chạy `.\scripts\start_web.ps1` để build và mở bản React + FastAPI. Khi nạp thành công, trang **Phân tích ván đấu** hiển thị danh sách đội và tuyển thủ để thiết lập đầu vào. Lần nạp đầu cần đọc lịch sử và mô hình nên có thể lâu hơn các thao tác tiếp theo.
+Kết quả mong đợi:
 
-## 4. Luồng demo trên giao diện React
+```text
+1
+```
 
-### Bước 1. Thiết lập thông tin ván đấu
-
-1. Chọn hai đội khác nhau ở bên xanh và bên đỏ. Có thể gõ tắt: `HLE` → Hanwha Life Esports; `Gen`, `geng` → Gen.G. Tìm kiếm không phân biệt hoa/thường và bỏ qua dấu câu, khoảng trắng.
-2. Ảnh tuyển thủ hiển thị cạnh ô chọn; thiếu ảnh sẽ có chữ viết tắt thay thế. Kiểm tra năm tuyển thủ mỗi đội theo các vị trí Đường trên, Đi rừng, Đường giữa, Xạ thủ và Hỗ trợ. Gợi ý được lấy từ lịch sử, nên cần sửa lại nếu đội hình thực tế khác.
-3. Nếu không thấy đội hoặc tuyển thủ cần chọn, bỏ chọn **Chỉ hiện tên có lịch sử**. Bản ghi trong danh mục vẫn có thể chưa có lịch sử liên kết.
-4. Nhập **Patch**. Ô **Giải / bối cảnh ván (tùy chọn)** dùng để ghi thêm thông tin ván đấu.
-5. Đánh dấu ô xác nhận hai đội, bên thi đấu, patch và tuyển thủ/vị trí do người dùng cung cấp.
-
-Cần đủ mười tuyển thủ khác nhau, mỗi người ở một vị trí. Đây là một phiên phân tích mới, không bắt buộc ván mục tiêu đã tồn tại trong cơ sở dữ liệu. Giao diện hiện không có ô để người dùng tự đặt mốc cắt lịch sử.
-
-### Bước 2. Tạo và xem PRE
-
-Nhấn **Tạo đánh giá PRE**. Hệ thống tổng hợp lịch sử hợp lệ, tính xác suất và lưu bản đánh giá. Bảng hiển thị xác suất PRE của ba mô hình theo đội đang được chọn; các thống kê lịch sử, số mẫu và cảnh báo dùng chung nằm bên dưới. Mở **Thông tin bản lưu và thời gian xử lý** để ghi lại mã PRE nếu muốn tra cứu sau.
-
-Mốc giới hạn lịch sử trong phiên tương tác được tính tại lúc tạo PRE: **00:00 UTC của ngày liền trước ngày tạo PRE theo UTC**. POST giữ nguyên mốc và thông tin nền này. Mốc trên là quy tắc lọc lịch sử, không phải thời điểm bắt đầu cấm/chọn được lấy trực tiếp từ giải đấu.
-
-### Bước 3. Nhập đội hình cuối cùng và tạo POST
-
-Sau khi cấm/chọn hoàn tất, chọn tướng cho từng tuyển thủ ở đủ mười vị trí. Danh sách phải có mười tướng hợp lệ và không trùng nhau. Nhấn **Tạo POST & so sánh** để tính và lưu đánh giá sau cấm/chọn.
-
-Kết quả POST hiển thị xác suất mới, lịch sử tuyển thủ–tướng và cảnh báo. Một cặp chưa có lịch sử được ghi **Chưa ghi nhận**, không tự xem là tỷ lệ thắng 0% hoặc 50%. Cảnh báo thiếu lịch sử liệt kê ngay tên **tuyển thủ — tướng**, đội và vị trí của từng cặp chưa ghi nhận. Mở **Thông tin bản lưu và thời gian xử lý** để lấy mã POST khi cần xem lại.
-
-### Bước 4. Xem so sánh và xử lý khi đổi đầu vào
-
-Sau POST, mỗi hàng mô hình có xác suất PRE, POST và thay đổi có dấu của đội đang chọn. Nhấn tên đội còn lại để đổi hướng xem. Ví dụ cách đọc: từ 54% lên 58% là **tăng 4 điểm phần trăm**. Đây chỉ là ví dụ giải thích đơn vị, không phải kết quả thực nghiệm. Baseline dùng tỷ lệ thắng BLUE học từ tập train nên PRE và POST có thể bằng nhau. Xác suất cao hơn ở một ván không chứng minh mô hình tốt hơn; Brier Score, Log Loss, ROC-AUC và calibration cần được đối chiếu riêng trên cùng tập đánh giá.
-
-| Thao tác thay đổi | Cách tiếp tục |
-| --- | --- |
-| Chỉ đổi tướng | Nhấn **Chỉnh sửa đội hình**; PRE được giữ, POST cũ mất hiệu lực; chọn lại rồi tạo POST mới. |
-| Đổi đội, bên thi đấu, tuyển thủ, vị trí, patch hoặc bối cảnh | Nhấn **Chỉnh sửa bối cảnh**, xác nhận lại đầu vào và tạo PRE mới trước khi tạo POST. |
-| Lưu kết quả bị lỗi | Kiểm tra kết nối/quyền ghi rồi thử lại thao tác. Kết quả chỉ được công bố sau khi lưu thành công. |
-
-Số mẫu ít là hạn chế của dữ liệu, không phải bằng chứng tuyển thủ hoặc đội yếu. Cần đọc số mẫu và cảnh báo cùng với xác suất.
-
-### Bước 5. Xem lại đánh giá đã lưu
-
-Mở **Bản đã lưu**, nhập **Mã đánh giá** rồi nhấn **Tra cứu bản lưu**. Mã đánh giá là số được cấp sau khi lưu thành công.
-
-Phần này chỉ hiển thị lại đầu vào, kết quả, cảnh báo và trạng thái bản lưu; không khôi phục phiên để tiếp tục tạo POST. Để phân tích lại, thiết lập đầu vào trong phiên hiện tại. Kết quả ba mô hình và identity từng bộ pipeline được lưu chung trong `input_snapshot.provenance.model_comparison` của đánh giá canonical, cùng transaction. Bản lưu cũ chỉ có một mô hình vẫn được đọc nguyên trạng; ứng dụng không tính thêm hoặc ghi đè dự đoán cũ.
-
-## 5. Lỗi thường gặp
-
-| Hiện tượng | Kiểm tra và xử lý |
-| --- | --- |
-| `No module named pip` | Chạy `.\.venv\Scripts\python.exe -m ensurepip --upgrade`, sau đó thực hiện lại bước cài `requirements-web.txt` ở mục 3.2. Kích hoạt `.venv` không tự cài pip. |
-| `No module named ensurepip` | Bản Python đang dùng thiếu thành phần tạo pip. Cần bản Python đầy đủ đúng phiên bản ở mục 3.1 rồi tạo môi trường riêng trên máy. |
-| `No matching distribution found` khi cài thư viện | Gửi lỗi cho sinh viên để kiểm tra bản Python, kho gói và bộ môi trường bàn giao. Không tự sửa các phiên bản đã cố định. |
-| Thiếu `DATABASE_URL` hoặc không kết nối được | Kiểm tra `.env`, tài khoản, tên database, cổng và dịch vụ PostgreSQL; chú ý biến môi trường có thể ghi đè `.env`. |
-| Chưa có đủ tệp model / không nạp được model | Kiểm tra cặp `.joblib` và `.json` trong `artifacts/models/`, manifest cùng hai `.joblib` trong `artifacts/models_comparison/`, và file `retrospective_pre_inputs.json`. Không thay mô hình bằng số dự đoán giả. |
-| Model không tương thích với môi trường | Đối chiếu đủ sáu phiên bản ở mục 3.1, bao gồm phiên bản vá của Python. |
-| Dữ liệu hoặc file đầu vào không khớp bản đã duyệt | Dùng đúng bộ PostgreSQL, hồ sơ thời gian và mô hình được bàn giao cùng nhau. Không bỏ qua kiểm tra mã băm. |
-| Lần nạp dữ liệu chưa hoàn tất | Khắc phục nguyên nhân rồi tải lại trang. |
-| Nút PRE bị khóa | Kiểm tra hai đội khác nhau, đủ mười tuyển thủ khác nhau, patch và ô xác nhận đầu vào. |
-| Nút POST bị khóa | Tạo PRE thành công, chọn đủ mười tướng khác nhau; nếu POST đã tồn tại và đầu vào không đổi thì không cần tạo lại. |
-| Chưa thể cập nhật trạng thái bản lưu | Khôi phục kết nối/quyền ghi rồi thử lại thao tác chỉnh sửa. |
-| Không đọc được đánh giá đã lưu | Kiểm tra mã số và cơ sở dữ liệu đang kết nối; bản ghi có thể nằm ở database khác. |
-| Không có ảnh đội, tuyển thủ hoặc tướng | Kiểm tra file trong `assets/` và đường dẫn media đã lưu. Thiếu ảnh không ngăn tạo PRE/POST. |
-| Không tìm thấy `start_web.ps1` | Chuyển vào thư mục gốc dự án bằng `cd` trước khi chạy. Dấu nhắc `(.venv)` không có nghĩa đang đứng đúng thư mục. |
-| `Unexpected token`, tiếng Việt thành `ChÆ...` trong script | Dùng bản script mới; thông báo trong script đã chuyển sang ASCII để tương thích Windows PowerShell 5.1. |
-| Giao diện chưa có thay đổi mới | Build lại frontend rồi nhấn **Ctrl+F5**. `-SkipBuild` chỉ dùng bản build đã tồn tại. |
-| Cổng 8000 đang được sử dụng | Nếu ứng dụng đã chạy, mở địa chỉ hiện có; hoặc dùng `.\scripts\start_web.ps1 -SkipBuild -Port 8001` rồi mở `http://127.0.0.1:8001`. |
-
-## 6. Các thư mục chính
-
-| Đường dẫn | Vai trò |
-| --- | --- |
-| `frontend/src/` | Giao diện React + TypeScript, ô tìm kiếm, ảnh và bảng so sánh. |
-| `match_insight/api/` | FastAPI, phiên phân tích, tài nguyên dùng chung và phục vụ ảnh. |
-| `scripts/start_web.ps1` | Build frontend và khởi động ứng dụng web. |
-| `docs/React_FastAPI.md` | Hướng dẫn kiến trúc, phát triển và vận hành web. |
-| `streamlit_app.py` | Điểm khởi động bản Streamlit cũ. |
-| `match_insight/ui/` | Nhập thông tin và trình bày kết quả. |
-| `match_insight/services/` | Điều phối PRE, POST, so sánh và lưu đánh giá. |
-| `match_insight/features/` | Tổng hợp đặc trưng và lọc lịch sử. |
-| `match_insight/ml/` | Tạo tập dữ liệu, huấn luyện, nạp và sử dụng mô hình. |
-| `match_insight/database/` | Mô hình bảng, đọc lịch sử và lưu kết quả. |
-| `match_insight/data_processing/` | Kiểm tra và chuẩn hóa dữ liệu nguồn. |
-| `alembic/` | Các phiên bản thay đổi cấu trúc PostgreSQL. |
-| `scripts/` | Các lệnh chuẩn bị dữ liệu và thực nghiệm ngoại tuyến. |
-| `data/`, `artifacts/`, `assets/` | Dữ liệu đầu vào, mô hình và tài nguyên hình ảnh. |
-| `reports/` | Báo cáo kiểm tra dữ liệu và thực nghiệm đã lưu. |
-
-Các script như `apply_oracle_etl.py`, `apply_oracle_riot_v5_backfill.py` và `train_real_models.py` phục vụ chuẩn bị dữ liệu hoặc thực nghiệm, không phải các bước khởi động giao diện. Nếu cần xây lại bộ dữ liệu/mô hình, đọc tham số và điều kiện đầu vào của từng script; các bước này có thể ghi database hoặc tạo file mới. Hướng dẫn trên tập trung chạy và sử dụng bộ hệ thống đã được chuẩn bị.
-
-## 7. Kiểm tra mã nguồn
+Sau đó:
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -X utf8 -m pytest
+.\scripts\start_web.ps1
+```
+
+---
+
+# Demo Flow
+
+## Phase I — Match Setup
+
+Chọn:
+
+```text
+BLUE team
+RED team
+Patch
+5 BLUE players
+5 RED players
+```
+
+Có thể tìm kiếm bằng tên rút gọn.
+
+Ví dụ:
+
+```text
+HLE       → Hanwha Life Esports
+Gen       → Gen.G
+geng      → Gen.G
+```
+
+Tìm kiếm:
+
+```text
+case-insensitive
+punctuation-insensitive
+whitespace-insensitive
+```
+
+Roster cần đủ năm vị trí:
+
+| Position | Role       |
+| -------- | ---------- |
+| TOP      | Đường trên |
+| JUNGLE   | Đi rừng    |
+| MID      | Đường giữa |
+| BOT      | Xạ thủ     |
+| SUPPORT  | Hỗ trợ     |
+
+Tổng cộng phải có **10 tuyển thủ khác nhau**.
+
+Ô:
+
+```text
+Giải / bối cảnh ván
+```
+
+là tùy chọn.
+
+Sau khi xác nhận:
+
+```text
+teams
+sides
+patch
+players
+positions
+```
+
+có thể tạo PRE.
+
+---
+
+## Phase II — PRE
+
+Nhấn:
+
+```text
+Tạo đánh giá PRE
+```
+
+Hệ thống:
+
+```text
+collect historical context
+        ↓
+filter eligible history
+        ↓
+build PRE features
+        ↓
+run three models
+        ↓
+persist evaluation
+        ↓
+return probabilities + warnings
+```
+
+Mốc lịch sử của phiên tương tác được xác định tại thời điểm tạo PRE:
+
+```text
+00:00 UTC
+of the day immediately before
+the PRE creation date in UTC
+```
+
+POST tiếp tục sử dụng cùng cutoff.
+
+Đây là quy tắc lọc lịch sử của hệ thống, không phải thời điểm draft thật được lấy trực tiếp từ giải đấu.
+
+---
+
+## Phase III — Final Draft
+
+Sau khi draft hoàn tất, chọn đủ:
+
+```text
+5 BLUE champions
+5 RED champions
+```
+
+Không được trùng tướng.
+
+Nhấn:
+
+```text
+Tạo POST & so sánh
+```
+
+POST bổ sung lịch sử:
+
+```text
+player × champion
+```
+
+Nếu một cặp chưa từng xuất hiện trong lịch sử:
+
+```text
+Chưa ghi nhận
+```
+
+Hệ thống không tự quy đổi thành:
+
+```text
+0%
+50%
+```
+
+Cảnh báo sẽ chỉ rõ:
+
+```text
+player
+champion
+team
+position
+```
+
+---
+
+## Phase IV — PRE vs POST
+
+Kết quả có dạng:
+
+| Model               |         PRE |        POST |  Δ |
+| ------------------- | ----------: | ----------: | -: |
+| Baseline            | probability | probability | pp |
+| Logistic Regression | probability | probability | pp |
+| Random Forest       | probability | probability | pp |
+
+Ví dụ:
+
+```text
+54% → 58%
+```
+
+được đọc là:
+
+```text
++4 percentage points
+```
+
+không phải:
+
+```text
++4%
+```
+
+Baseline học tỷ lệ thắng BLUE từ train set nên PRE và POST có thể bằng nhau.
+
+Một xác suất lớn hơn ở một ván **không có nghĩa mô hình tốt hơn**.
+
+Đánh giá chất lượng model cần dựa vào các metric như:
+
+```text
+Brier Score
+Log Loss
+ROC-AUC
+Calibration
+```
+
+trên cùng evaluation set.
+
+---
+
+# Editing an Analysis
+
+| Changed input    | Required action                                 |
+| ---------------- | ----------------------------------------------- |
+| Chỉ đổi champion | **Chỉnh sửa đội hình** → giữ PRE → tạo POST mới |
+| Team             | Tạo PRE mới                                     |
+| Side             | Tạo PRE mới                                     |
+| Player           | Tạo PRE mới                                     |
+| Position         | Tạo PRE mới                                     |
+| Patch            | Tạo PRE mới                                     |
+| Context          | Tạo PRE mới                                     |
+
+Nếu lưu kết quả thất bại:
+
+```text
+fix database connection / write permission
+        ↓
+retry operation
+```
+
+Kết quả chỉ được công bố sau khi persistence thành công.
+
+---
+
+# Saved Evaluations
+
+Mở:
+
+```text
+Bản đã lưu
+```
+
+Nhập:
+
+```text
+Mã đánh giá
+```
+
+sau đó:
+
+```text
+Tra cứu bản lưu
+```
+
+Màn hình cho phép xem lại:
+
+```text
+input
+prediction
+warnings
+persistence status
+```
+
+Việc tra cứu không phục hồi phiên phân tích để tiếp tục tạo POST.
+
+Model comparison provenance được lưu trong:
+
+```text
+input_snapshot.provenance.model_comparison
+```
+
+cùng transaction của evaluation canonical.
+
+Các bản ghi cũ chỉ chứa một model vẫn được đọc nguyên trạng và không bị tính lại.
+
+---
+
+# Project Structure
+
+```text
+Match Insight
+│
+├── frontend/
+│   └── src/
+│       React + TypeScript application
+│
+├── match_insight/
+│   │
+│   ├── api/
+│   │   FastAPI, analysis sessions, assets
+│   │
+│   ├── services/
+│   │   PRE, POST, comparison, persistence
+│   │
+│   ├── features/
+│   │   historical aggregation and filtering
+│   │
+│   ├── ml/
+│   │   datasets, training, model loading, inference
+│   │
+│   ├── database/
+│   │   schema models, queries, persistence
+│   │
+│   └── data_processing/
+│       source validation and normalization
+│
+├── artifacts/
+│   trained model artifacts
+│
+├── assets/
+│   champions · teams · players
+│
+├── data/
+│   input and reference data
+│
+├── reports/
+│   data-quality and experiment reports
+│
+├── alembic/
+│   PostgreSQL schema migrations
+│
+├── scripts/
+│   ETL, training and maintenance scripts
+│
+├── docs/
+│   project documentation
+│
+├── streamlit_app.py
+│   legacy Streamlit entrypoint
+│
+└── README.md
+```
+
+Một số script như:
+
+```text
+apply_oracle_etl.py
+apply_oracle_riot_v5_backfill.py
+train_real_models.py
+```
+
+thuộc pipeline chuẩn bị dữ liệu / experiment và **không phải** bước cần chạy để mở web application.
+
+---
+
+# Troubleshooting
+
+<details>
+<summary><b>No module named pip</b></summary>
+
+<br>
+
+Chạy:
+
+```powershell
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+```
+
+Sau đó:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-web.txt
+```
+
+</details>
+
+<details>
+<summary><b>No module named ensurepip</b></summary>
+
+<br>
+
+Python đang sử dụng thiếu thành phần cần thiết.
+
+Cài bản Python đầy đủ đúng version:
+
+```text
+Python 3.12.14
+```
+
+sau đó tạo lại `.venv`.
+
+</details>
+
+<details>
+<summary><b>No matching distribution found</b></summary>
+
+<br>
+
+Kiểm tra:
+
+```text
+Python version
+package index
+platform compatibility
+locked dependencies
+```
+
+Không tự thay các version model dependency chỉ để hoàn thành cài đặt.
+
+</details>
+
+<details>
+<summary><b>Không tìm thấy DATABASE_URL</b></summary>
+
+<br>
+
+Kiểm tra:
+
+```text
+.env
+PostgreSQL username
+password
+host
+port
+database
+```
+
+Đồng thời kiểm tra PowerShell có biến `DATABASE_URL` cũ đang override `.env` hay không.
+
+</details>
+
+<details>
+<summary><b>Model không load được</b></summary>
+
+<br>
+
+Kiểm tra:
+
+```text
+artifacts/models/retrospective_pre_post.joblib
+artifacts/models/retrospective_pre_post.json
+
+artifacts/models_comparison/manifest.json
+artifacts/models_comparison/baseline_pre_post.joblib
+artifacts/models_comparison/random_forest_pre_post.joblib
+
+data/reference/retrospective_pre_inputs.json
+```
+
+Không thay model bằng prediction giả hoặc bỏ qua hash validation.
+
+</details>
+
+<details>
+<summary><b>Model environment mismatch</b></summary>
+
+<br>
+
+Đối chiếu đủ:
+
+```text
+Python
+NumPy
+pandas
+scikit-learn
+SciPy
+joblib
+```
+
+bao gồm patch version của Python.
+
+</details>
+
+<details>
+<summary><b>Nút PRE bị khóa</b></summary>
+
+<br>
+
+Kiểm tra:
+
+```text
+2 teams khác nhau
+10 players khác nhau
+đúng positions
+patch
+input confirmation
+```
+
+</details>
+
+<details>
+<summary><b>Nút POST bị khóa</b></summary>
+
+<br>
+
+Cần:
+
+```text
+PRE đã tạo thành công
+10 champions hợp lệ
+không trùng champion
+```
+
+</details>
+
+<details>
+<summary><b>Không hiển thị ảnh</b></summary>
+
+<br>
+
+Kiểm tra:
+
+```text
+assets/champions/
+assets/teams/
+assets/players/
+```
+
+Thiếu ảnh không ngăn inference.
+
+</details>
+
+<details>
+<summary><b>Không tìm thấy start_web.ps1</b></summary>
+
+<br>
+
+Đảm bảo terminal đang đứng ở project root:
+
+```powershell
+cd "C:\Đồ án ngành"
+```
+
+Việc terminal hiển thị:
+
+```text
+(.venv)
+```
+
+không có nghĩa bạn đang đứng đúng thư mục.
+
+</details>
+
+<details>
+<summary><b>Unexpected token hoặc lỗi encoding Windows PowerShell</b></summary>
+
+<br>
+
+Sử dụng bản script hiện tại.
+
+Thông báo nội bộ trong script đã được chuyển sang ASCII để tương thích Windows PowerShell 5.1.
+
+</details>
+
+<details>
+<summary><b>Frontend chưa cập nhật</b></summary>
+
+<br>
+
+Build lại:
+
+```powershell
+npm.cmd --prefix frontend ci
 npm.cmd --prefix frontend run build
 ```
 
-Xem [biên bản kiểm chứng React + FastAPI](reports/authored/react_fastapi_acceptance.md) để đọc phạm vi kiểm tra, số đo tốc độ và giới hạn của phép đo.
+sau đó:
+
+```text
+Ctrl + F5
+```
+
+`-SkipBuild` chỉ dùng build đã tồn tại.
+
+</details>
+
+<details>
+<summary><b>Port 8000 already in use</b></summary>
+
+<br>
+
+Nếu application đã chạy, mở instance hiện có.
+
+Hoặc:
+
+```powershell
+.\scripts\start_web.ps1 -SkipBuild -Port 8001
+```
+
+sau đó truy cập:
+
+```text
+http://127.0.0.1:8001
+```
+
+</details>
+
+---
+
+# Development & Verification
+
+Cài development dependencies:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements-dev.txt
+```
+
+Chạy test:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m pytest
+```
+
+Build frontend:
+
+```powershell
+npm.cmd --prefix frontend run build
+```
+
+Biên bản kiểm chứng React + FastAPI:
+
+[`reports/authored/react_fastapi_acceptance.md`](reports/authored/react_fastapi_acceptance.md)
+
+---
+
+# Scope
+
+Match Insight tập trung vào **pre-game analysis**.
+
+Hệ thống hiện không:
+
+```text
+fetch live draft automatically
+update probability during the match
+recommend champion picks
+optimize draft strategy
+provide betting recommendations
+```
+
+Người dùng chủ động cung cấp:
+
+```text
+match context
+roster
+patch
+final champions
+```
+
+Hệ thống sau đó sử dụng dữ liệu lịch sử đã được chuẩn hóa để tạo PRE và POST.
+
+---
+
+<div align="center">
+
+<br>
+
+### MATCH INSIGHT
+
+*Two states of the same match.*
+
+**Before the draft. After the draft.
+See what changed.**
+
+<br>
+
+`PRE` ───────── `DRAFT` ───────── `POST`
+
+<br>
+
+Built around professional League of Legends match data.
+
+</div>
